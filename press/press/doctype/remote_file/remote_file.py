@@ -11,7 +11,7 @@ import requests
 from boto3 import client, resource
 from frappe.model.document import Document
 from frappe.utils.password import get_decrypted_password
-
+from press.press.doctype.virtual_machine.virtual_machine import AWS_SERIAL_CONSOLE_ENDPOINT_MAP
 
 def get_remote_key(file):
 	from hashlib import sha1
@@ -267,7 +267,7 @@ def delete_s3_files(buckets):
 				"offsite_backups_secret_access_key", raise_exception=False
 			),
 			endpoint_url=frappe.db.get_value("Backup Bucket", bucket_name, "endpoint_url")
-			or "https://s3.amazonaws.com",
+			or AWS_SERIAL_CONSOLE_ENDPOINT_MAP[press_settings.backup_region]["endpoint"],
 		)
 		bucket = s3.Bucket(bucket_name)
 		for objects in chunk([{"Key": x} for x in buckets[bucket_name]], 1000):
