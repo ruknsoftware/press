@@ -98,8 +98,8 @@ export default {
 			const options = {
 				key: data.key_id,
 				order_id: data.order_id,
-				name: 'Frappe Cloud',
-				image: '/assets/press/images/frappe-cloud-logo.png',
+				name: 'Rukn Cloud',
+				image: '/assets/press/images/rukn-logo.svg',
 				prefill: {
 					email: this.$team.doc.user,
 				},
