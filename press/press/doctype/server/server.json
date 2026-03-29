@@ -23,6 +23,7 @@
   "is_server_prepared",
   "is_server_renamed",
   "is_provisioning_press_job_completed",
+  "nat_server",
   "is_self_hosted",
   "keep_files_on_server_in_offsite_backup",
   "public",
@@ -748,6 +749,12 @@
    "fieldname": "enable_on_prem_failover_support",
    "fieldtype": "Check",
    "label": "Enable On-Prem Failover Support"
+  },
+  {
+   "fieldname": "nat_server",
+   "fieldtype": "Link",
+   "label": "NAT Server",
+   "options": "NAT Server"
   }
  ],
  "links": [
@@ -760,7 +767,7 @@
    "link_fieldname": "app_server"
   }
  ],
- "modified": "2026-03-17 17:02:43.407765",
+ "modified": "2026-03-29 18:09:35.170679",
  "modified_by": "Administrator",
  "module": "Press",
  "name": "Server",
