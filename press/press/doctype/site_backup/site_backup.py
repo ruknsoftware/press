@@ -10,13 +10,17 @@ from typing import TYPE_CHECKING
 
 import frappe
 import frappe.utils
+from frappe import _
 from frappe.desk.doctype.tag.tag import add_tag
 from frappe.model.document import Document
 
 from press.agent import Agent
-from press.exceptions import SiteTooManyPendingBackups
+from press.exceptions import SiteTooManyPendingBackups, SiteUpdateInProgress
+from press.guards import role_guard
 from press.overrides import get_permission_query_conditions_for_doctype
 from press.press.doctype.ansible_console.ansible_console import AnsibleAdHoc
+from press.press.doctype.communication_info.communication_info import get_communication_info
+from press.utils import docs
 
 if TYPE_CHECKING:
 	from datetime import date
@@ -24,6 +28,14 @@ if TYPE_CHECKING:
 	from press.press.doctype.agent_job.agent_job import AgentJob
 	from press.press.doctype.site_update.site_update import SiteUpdate
 	from press.press.doctype.virtual_machine.virtual_machine import VirtualMachine
+
+
+REMOTE_FILE_FIELDS = (
+	"remote_database_file",
+	"remote_public_file",
+	"remote_private_file",
+	"remote_config_file",
+)
 
 
 class SiteBackup(Document):
@@ -102,20 +114,22 @@ class SiteBackup(Document):
 		"""
 		Remove records with `Success` but files_availability is `Unavailable`
 		"""
-		sb = frappe.qb.DocType("Site Backup")
-		query = query.where(~((sb.files_availability == "Unavailable") & (sb.status == "Success")))
+		Backup = frappe.qb.DocType("Site Backup")
+		query = query.where(~((Backup.files_availability == "Unavailable") & (Backup.status == "Success")))
 		if filters.get("backup_date"):
 			with contextlib.suppress(Exception):
 				date = frappe.utils.getdate(filters["backup_date"])
 				query = query.where(
-					sb.creation.between(
+					Backup.creation.between(
 						frappe.utils.add_to_date(date, hours=0, minutes=0, seconds=0),
 						frappe.utils.add_to_date(date, hours=23, minutes=59, seconds=59),
 					)
 				)
 
+		query = role_guard.filter_permitted(query, "Site", Backup.site)
+
 		if not filters.get("status"):
-			query = query.where(sb.status == "Success")
+			query = query.where(Backup.status == "Success")
 
 		results = [
 			result
@@ -139,9 +153,13 @@ class SiteBackup(Document):
 
 	def validate(self):
 		if self.physical and self.with_files:
-			frappe.throw("Physical backups cannot be taken with files")
+			frappe.throw(
+				f"Physical backups already include site files, so the 'with files' option can't be used. Please clear that option and try again. {docs.doc_link(docs.BACKUPS)}."
+			)
 		if self.physical and self.offsite:
-			frappe.throw("Physical and offsite logical backups cannot be taken together")
+			frappe.throw(
+				f"A backup can't be both physical and offsite. Please choose either a physical backup or an offsite logical backup. {docs.doc_link(docs.BACKUPS)}."
+			)
 
 		if self.deactivate_site_during_backup and not self.physical:
 			frappe.throw("Site deactivation should be used for physical backups only")
@@ -150,9 +168,18 @@ class SiteBackup(Document):
 		if self.flags.get("skip_backup_after_insert"):
 			return
 
+		# The update's own physical backup runs before its migrate job, so it can't clash
+		if not self.for_site_update and frappe.get_doc("Site", self.site).is_migrate_running():
+			frappe.throw(
+				"This site is being updated. Please take a backup after the update finishes.",
+				SiteUpdateInProgress,
+			)
+
 		if getattr(self, "force", False):
 			if self.physical:
-				frappe.throw("Physical backups cannot be forcefully triggered")
+				frappe.throw(
+					"Physical backups can't be force-triggered. Please take a regular backup, or wait for the scheduled physical backup to run."
+				)
 			return
 
 		# For backups, check if there are too many pending backups
@@ -200,7 +227,9 @@ class SiteBackup(Document):
 			site.sync_info()
 			site.reload()
 		if not site.database_name:
-			frappe.throw("Database name is missing in the site")
+			frappe.throw(
+				"This site doesn't have a database name set yet, so a physical backup can't be taken. Please try again once the site has finished provisioning, or contact support."
+			)
 		self.database_name = site.database_name
 		self.snapshot_request_key = frappe.generate_hash(length=32)
 
@@ -365,7 +394,9 @@ class SiteBackup(Document):
 
 		virtual_machine.create_snapshots(exclude_boot_volume=True, physical_backup=True)
 		if len(virtual_machine.flags.created_snapshots) == 0:
-			frappe.throw("Failed to create a snapshot for the database server")
+			frappe.throw(
+				"We couldn't create a disk snapshot for the database server, so the physical backup failed. Please retry, and contact support if it keeps failing."
+			)
 		frappe.db.set_value(
 			"Site Backup", self.name, "database_snapshot", virtual_machine.flags.created_snapshots[0]
 		)
@@ -403,21 +434,22 @@ class SiteBackup(Document):
 		return False
 
 	def fix_global_search_indexes(self):
-		"""
-		Run this whenever Backup Job fails because of broken global search indexes and regenerate them.
-		"""
-		job = frappe.db.get_value("Agent Job", self.job, ["bench", "server", "output"], as_dict=True)
+		"""Rebuild __global_search when the backup failed because that table is crashed."""
+		job = frappe.db.get_value("Agent Job", self.job, ["output", "traceback"], as_dict=True)
+		if not is_global_search_crashed(f"{job.output or ''}\n{job.traceback or ''}"):
+			return
 
-		if job.output and "Couldn't execute 'show create table `__global_search`'" in job.output:
-			try:
-				agent = Agent(self.server)
-				agent.create_agent_job("Fix global search", "fix_global_search")
-			except Exception:
-				frappe.log_error(
-					"Failed to fix global search indexes",
-					reference_doctype=self.doctype,
-					reference_name=self.name,
-				)
+		try:
+			site = frappe.get_doc("Site", self.site)
+			Agent(site.server).fix_global_search(
+				site, reference_doctype=self.doctype, reference_name=self.name
+			)
+		except Exception:
+			frappe.log_error(
+				"Failed to fix global search indexes",
+				reference_doctype=self.doctype,
+				reference_name=self.name,
+			)
 
 	@classmethod
 	def offsite_backup_exists(cls, site: str, day: date) -> bool:
@@ -446,11 +478,18 @@ class OngoingSnapshotError(Exception):
 	pass
 
 
-def track_offsite_backups(site: str, backup_data: dict, offsite_backup_data: dict) -> tuple:
+def get_uploaded_bucket(job: AgentJob) -> str:
+	"""The bucket the agent uploaded to. The cluster's bucket can change after the upload."""
+	offsite_config = json.loads(job.request_data or "{}").get("offsite") or {}
+	return offsite_config.get("bucket") or get_backup_bucket(frappe.db.get_value("Site", job.site, "cluster"))
+
+
+def track_offsite_backups(job: AgentJob, backup_data: dict, offsite_backup_data: dict) -> tuple:
+	site = job.site
 	remote_files = {"database": None, "site_config": None, "public": None, "private": None}
 
 	if offsite_backup_data:
-		bucket = get_backup_bucket(frappe.db.get_value("Site", site, "cluster"))
+		bucket = get_uploaded_bucket(job)
 		for type, backup in backup_data.items():
 			file_name, file_size = backup["file"], backup["size"]
 			file_path = offsite_backup_data.get(file_name)
@@ -483,6 +522,13 @@ def track_offsite_backups(site: str, backup_data: dict, offsite_backup_data: dic
 	)
 
 
+def is_global_search_crashed(output: str) -> bool:
+	# MyISAM marks __global_search crashed after an unclean MariaDB stop, and mariadb-dump stops on it
+	return "__global_search" in output and (
+		"marked as crashed" in output or "Couldn't execute 'show create table `__global_search`'" in output
+	)
+
+
 def process_backup_site_job_update(job):
 	backups = frappe.get_all("Site Backup", fields=["name", "status"], filters={"job": job.name}, limit=1)
 	if not backups:
@@ -490,10 +536,10 @@ def process_backup_site_job_update(job):
 	backup = backups[0]
 	if job.status != backup.status:
 		status = job.status
-		if job.status == "Delivery Failure":
+		if status in ("Delivery Failure", "Cancelled"):
 			status = "Failure"
 
-		if job.status == "Success":
+		if status == "Success":
 			if frappe.get_value("Site Backup", backup.name, "physical"):
 				doc: SiteBackup = frappe.get_doc("Site Backup", backup.name)
 				doc.files_availability = "Available"
@@ -508,7 +554,7 @@ def process_backup_site_job_update(job):
 					remote_config_file,
 					remote_public,
 					remote_private,
-				) = track_offsite_backups(job.site, backup_data, offsite_backup_data)
+				) = track_offsite_backups(job, backup_data, offsite_backup_data)
 
 				site_backup_dict = {
 					"files_availability": "Available",
@@ -548,14 +594,71 @@ def process_backup_site_job_update(job):
 			site_backup.status = status
 			site_backup.save()
 
+			_send_backup_failure_email_to_user(site_backup, cancelled=job.status == "Cancelled")
+
+
+def _send_backup_failure_email_to_user(site_backup: SiteBackup, cancelled: bool = False):
+	try:
+		if site_backup.status != "Failure" or cancelled:
+			return
+
+		site_name = site_backup.site
+		if _has_reached_max_failed_backup_attempts(site_name):
+			recipients = get_communication_info("Email", "Site Activity", "Site", site_name)
+			if not recipients:
+				return
+
+			subject = _("Backup attempts failed for {0}").format(site_name)
+			content = frappe.render_template(
+				"press/templates/emails/site_backup_failed.html",
+				{
+					"site_name": site_name,
+				},
+				is_path=True,
+			)
+			communication = frappe.get_doc(
+				{
+					"doctype": "Communication",
+					"communication_type": "Communication",
+					"communication_medium": "Email",
+					"reference_doctype": "Site Backup",
+					"reference_name": site_backup.name,
+					"subject": subject,
+					"content": content,
+					"is_notification": True,
+					"recipients": ", ".join(recipients),
+				}
+			)
+			communication.insert(ignore_permissions=True)
+			communication.send_email()
+	except Exception:
+		frappe.log_error(
+			title="Failed to send backup failure email",
+			reference_doctype="Site Backup",
+			reference_name=site_backup.name,
+		)
+
 
 def get_backup_bucket(cluster, region=False):
-	bucket_for_cluster = frappe.get_all("Backup Bucket", {"cluster": cluster}, ["name", "region"], limit=1)
-	default_bucket = frappe.db.get_single_value("Press Settings", "aws_s3_bucket")
+	bucket_name = frappe.db.get_value("Cluster", cluster, "backup_bucket")
+	if not bucket_name:
+		frappe.throw(_("Set the Backup Bucket of cluster {0}").format(cluster), frappe.MandatoryError)
+
+	bucket_config = frappe.db.get_value(
+		"Backup Bucket", bucket_name, ["name", "region", "endpoint_url"], as_dict=True
+	)
+	if not bucket_config:
+		frappe.throw(
+			_("Backup Bucket {0} of cluster {1} does not exist").format(bucket_name, cluster),
+			frappe.DoesNotExistError,
+		)
+	# The provider is only configured on Press Settings
+	bucket_config["provider"] = frappe.db.get_single_value("Press Settings", "offsite_backups_provider")
 
 	if region:
-		return bucket_for_cluster[0] if bucket_for_cluster else default_bucket
-	return bucket_for_cluster[0]["name"] if bucket_for_cluster else default_bucket
+		return bucket_config
+
+	return bucket_config["name"]
 
 
 def process_deactivate_site_job_update(job: AgentJob):
@@ -593,7 +696,7 @@ def _create_site_backup_from_agent_job(job: "AgentJob"):
 	try:
 		from press.press.doctype.site_backup.site_backup import track_offsite_backups
 
-		if (job.job_type not in ["Archive Site", "Uninstall App from Site"]) or not job.data:
+		if (job.job_type not in ["Archive Site", "Uninstall App from Site"]) or not job.data or not job.site:
 			return
 
 		job_data = json.loads(job.data)
@@ -611,7 +714,7 @@ def _create_site_backup_from_agent_job(job: "AgentJob"):
 			remote_config_file,
 			remote_public,
 			remote_private,
-		) = track_offsite_backups(job.site, backup_data, offsite_backup_data)
+		) = track_offsite_backups(job, backup_data, offsite_backup_data)
 
 		site_server = frappe.db.get_value("Site", job.site, "server")
 		site_backup = frappe.get_doc(
@@ -840,3 +943,29 @@ def delete_backups_for_archived_sites_after_retention():
 			)
 
 	frappe.db.commit()
+
+
+def get_max_failed_backup_attempts() -> int:
+	return (
+		frappe.get_cached_value(
+			"Press Settings",
+			"Press Settings",
+			"max_failed_backup_attempts_in_a_day",
+		)
+		or 6
+	)
+
+
+def _has_reached_max_failed_backup_attempts(site_name: str) -> bool:
+	max_backup_attempts = get_max_failed_backup_attempts()
+
+	backup_failures = frappe.db.count(
+		"Site Backup",
+		{
+			"site": site_name,
+			"status": ("in", ["Failure", "Delivery Failure"]),
+			"creation": (">=", frappe.utils.add_days(None, -1)),
+		},
+	)
+
+	return backup_failures == max_backup_attempts

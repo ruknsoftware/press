@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
+from hcloud import APIException
 
 from press.press.doctype.cluster.test_cluster import create_test_cluster
 from press.press.doctype.root_domain.test_root_domain import create_test_root_domain
@@ -100,3 +101,48 @@ class TestVirtualMachine(FrappeTestCase):
 			vm.create_database_server()
 		except Exception as e:
 			self.fail(e)
+
+	def test_no_private_ip_collision(self):
+		list_of_series = ["n", "f", "m", "c", "p", "e", "r", "u", "t", "nfs", "fs", "nat"]
+		list_of_big_series = ["f", "m", "u", "t"]
+		vm_doc: VirtualMachine = frappe.new_doc("Virtual Machine")
+		vm_doc.subnet_cidr_block = "10.29.0.0/16"
+
+		allocated_ips = set()  # to keep track of collisions
+		for series in list_of_series:
+			if series in ["c", "r"]:  # unused
+				continue
+			vm_doc.series = series
+			max_index = 256  # most series will never have these many instances
+			if series in list_of_big_series:
+				max_index = 8192  # f, m, u and t have a theoretical max of 8192
+
+			for idx in range(max_index):
+				vm_doc.index = idx + 1
+				ip = vm_doc.get_private_ip()
+				self.assertTrue(ip not in allocated_ips)
+				allocated_ips.add(ip)
+
+
+class TestHetznerFirewallRetry(FrappeTestCase):
+	def firewall_call(self, method: str, error_code: str | None):
+		vm = frappe.get_doc({"doctype": "Virtual Machine", "cloud_provider": "Hetzner", "instance_id": "42"})
+		firewall = MagicMock()
+		hetzner_method = {
+			"attach_to_firewall": "apply_to_resources",
+			"detach_from_firewall": "remove_from_resources",
+		}
+		if error_code:
+			getattr(firewall, hetzner_method[method]).side_effect = APIException(error_code, "", None)
+		with patch.object(VirtualMachine, "client") as client:
+			client.return_value.firewalls.get_by_id.return_value = firewall
+			getattr(vm, method)(7)
+
+	def test_attach_and_detach_ignore_already_done_errors_so_retries_do_not_fail(self):
+		self.firewall_call("attach_to_firewall", "firewall_already_applied")
+		self.firewall_call("detach_from_firewall", "firewall_already_removed")
+
+	def test_attach_and_detach_raise_other_errors(self):
+		for method in ("attach_to_firewall", "detach_from_firewall"):
+			with self.assertRaises(APIException):
+				self.firewall_call(method, "forbidden")

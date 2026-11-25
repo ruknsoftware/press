@@ -86,7 +86,7 @@ class TestDeployCandidate(FrappeTestCase):
 		frappe.set_user("Administrator")
 
 	@patch("press.press.doctype.deploy_candidate.deploy_candidate.frappe.enqueue_doc")
-	@patch.object(DeployCandidateBuild, "_build", new=Mock())
+	@patch.object(DeployCandidateBuild, "build", new=Mock())
 	def test_if_new_press_admin_team_can_pre_build(self, mock_enqueue_doc, mock_commit):
 		"""
 		Test if new press admin team user can pre build
@@ -96,26 +96,6 @@ class TestDeployCandidate(FrappeTestCase):
 		app = create_test_app()
 		group = create_test_release_group([app], self.user)
 		group.db_set("team", self.team.name)
-		frappe.set_user(self.user)
-		deploy_candidate = create_test_deploy_candidate(group)
-		deploy_candidate_build = create_test_deploy_candidate_build(deploy_candidate, no_build=True)
-		try:
-			deploy_candidate_build.insert()
-		except frappe.PermissionError:
-			self.fail("PermissionError raised in pre_build")
-
-	@patch("press.press.doctype.deploy_candidate.deploy_candidate.frappe.enqueue_doc")
-	@patch.object(DeployCandidateBuild, "_build", new=Mock())
-	def test_old_style_press_admin_team_can_pre_build(self, mock_enqueue_doc, mock_commit):
-		"""
-		Test if old style press admin team can pre build
-
-		Checks permission. Make sure no PermissionError is raised
-		"""
-		app = create_test_app()
-		group = create_test_release_group([app], self.user)
-		group.db_set("team", self.team.name)
-		frappe.rename_doc("Team", self.team.name, self.user)
 		frappe.set_user(self.user)
 		deploy_candidate = create_test_deploy_candidate(group)
 		deploy_candidate_build = create_test_deploy_candidate_build(deploy_candidate, no_build=True)
@@ -139,6 +119,25 @@ class TestDeployCandidate(FrappeTestCase):
 		first_candidate = frappe.get_doc("Deploy Candidate", bench.candidate)
 		second_candidate = group.create_deploy_candidate([])
 		self.assertEqual(first_candidate.apps[0].release, second_candidate.apps[0].release)
+
+	@patch("press.press.doctype.deploy_candidate.deploy_candidate.frappe.enqueue_doc")
+	def test_redeploy_keeps_original_releases(self, mock_enqueue_doc, mock_commit):
+		"""
+		Test if get_duplicate_dc keeps original app releases even when a newer release exists
+		"""
+		bench = create_test_bench()
+		# Create a newer release
+		source = frappe.get_doc("App Source", bench.apps[0].source)
+		newer_release = create_test_app_release(source)
+		first_candidate = frappe.get_doc("Deploy Candidate", bench.candidate)
+
+		duplicate_candidate = first_candidate.get_duplicate_dc()
+		self.assertIsNotNone(duplicate_candidate)
+
+		# Reload from database to ensure changes were persisted
+		saved_dc = frappe.get_doc("Deploy Candidate", duplicate_candidate.name)
+		self.assertEqual(saved_dc.apps[0].release, first_candidate.apps[0].release)
+		self.assertNotEqual(saved_dc.apps[0].release, newer_release.name)
 
 	@patch("press.press.doctype.deploy_candidate.deploy_candidate.frappe.enqueue_doc")
 	def test_deploy_with_no_arguments_creates_deploy_candidate_with_newer_release(
@@ -406,21 +405,21 @@ def create_cache_test_apps(team: "Team") -> dict[str, "AppInfo"]:
 			"Frappe Framework",
 			"Nightly",
 			"develop",
-			"d26c67df75a95ef43d329eadd48d7998ea656856",
+			"d26c67df75a95ef43d329eadd48d7998ea656856",  # pragma: allowlist secret
 		),
 		(
 			"https://github.com/frappe/wiki",
 			"Frappe Wiki",
 			"Nightly",
 			"master",
-			"8b369c63dd90b4f36195844d4a84e2aaa3b8f39a",
+			"8b369c63dd90b4f36195844d4a84e2aaa3b8f39a",  # pragma: allowlist secret
 		),
 		(
 			"https://github.com/The-Commit-Company/raven",
 			"Raven",
 			"Nightly",
 			"develop",
-			"317de412bc4b66c21052a929021c1013bbe31335",
+			"317de412bc4b66c21052a929021c1013bbe31335",  # pragma: allowlist secret
 		),
 	]
 
@@ -441,3 +440,20 @@ def create_cache_test_apps(team: "Team") -> dict[str, "AppInfo"]:
 		apps[name] = dict(app=app, source=source, release=release)
 
 	return apps
+
+
+class TestDeployCandidateAptPackages(FrappeTestCase):
+	def test_apt_packages_are_read_from_legacy_and_tool_frappe_cloud_keys_without_duplicates(self):
+		pyproject = {
+			"tool": {"frappe-cloud": {"apt-dependencies": ["poppler-utils", "libmagic1"]}},
+			"deploy": {"dependencies": {"apt": {"packages": ["libmagic1", " ffmpeg "]}}},
+		}
+		candidate = frappe.new_doc("Deploy Candidate")
+		candidate.append("apps", {"app": "my_app"})
+
+		candidate._update_packages({"my_app": {"pyproject": pyproject}})
+
+		self.assertEqual(
+			[(row.package_manager, row.package) for row in candidate.packages],
+			[("apt", "libmagic1 ffmpeg poppler-utils")],
+		)

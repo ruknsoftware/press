@@ -24,10 +24,7 @@
 		"directory"
 	],
 	"fields": [
-		{
-			"fieldname": "command",
-			"fieldtype": "Section Break"
-		},
+		{ "fieldname": "command", "fieldtype": "Section Break" },
 		{
 			"fieldname": "bench",
 			"fieldtype": "Link",
@@ -37,10 +34,7 @@
 			"options": "Bench",
 			"read_only": 1
 		},
-		{
-			"fieldname": "column_break_neym",
-			"fieldtype": "Column Break"
-		},
+		{ "fieldname": "column_break_neym", "fieldtype": "Column Break" },
 		{
 			"fieldname": "status",
 			"fieldtype": "Data",
@@ -89,10 +83,7 @@
 			"label": "Duration (seconds)",
 			"read_only": 1
 		},
-		{
-			"fieldname": "column_break_irvb",
-			"fieldtype": "Column Break"
-		},
+		{ "fieldname": "column_break_irvb", "fieldtype": "Column Break" },
 		{
 			"fieldname": "end",
 			"fieldtype": "Datetime",
@@ -130,7 +121,7 @@
 	"in_create": 1,
 	"index_web_pages_for_search": 1,
 	"links": [],
-	"modified": "2024-03-21 11:44:01.218664",
+	"modified": "2026-11-13 18:00:00.000000",
 	"modified_by": "Administrator",
 	"module": "Press",
 	"name": "Bench Shell Log",
@@ -147,6 +138,11 @@
 			"role": "System Manager",
 			"share": 1,
 			"write": 1
+		},
+		{
+			"if_owner": 1,
+			"read": 1,
+			"role": "Press Support Engineer"
 		}
 	],
 	"sort_field": "modified",

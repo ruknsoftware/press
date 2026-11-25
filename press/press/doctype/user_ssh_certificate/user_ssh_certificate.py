@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2019, Frappe and contributors
 # For license information, please see license.txt
 
@@ -11,9 +10,10 @@ import shlex
 import subprocess
 
 import frappe
-from frappe import safe_decode
+from frappe import _, safe_decode
 from frappe.model.document import Document
 
+from press.access.server_access import check_server_access
 from press.utils import log_error
 
 
@@ -43,6 +43,7 @@ class UserSSHCertificate(Document):
 	# end: auto-generated types
 
 	def validate(self):
+		self.validate_issuer()
 		if not self.ssh_public_key:
 			frappe.throw("Please make sure that a valid public key has been added in team doc.")
 
@@ -51,6 +52,60 @@ class UserSSHCertificate(Document):
 			base64.b64decode(self.ssh_public_key.strip().split()[1])
 		except binascii.Error:
 			frappe.throw("Please ensure that the attached text is a valid public key")
+
+	def validate_issuer(self):
+		"""Staff without full SSH rights issue a certificate for themselves, for one server they may reach."""
+		roles = frappe.get_roles()
+		if "System Manager" in roles or "Press SSH Manager" in roles:
+			return
+		self.validate_own_certificate()
+		self.validate_single_server()
+		self.validate_server_role(roles)
+
+	def validate_own_certificate(self):
+		if self.user != frappe.session.user:
+			frappe.throw(_("You can only issue an SSH certificate for yourself."), frappe.PermissionError)
+		self.validate_own_key()
+
+	def validate_own_key(self):
+		"""The public key is fetched from the User SSH Key. Compare it too, so a pasted key cannot pass."""
+		key = frappe.db.get_value("User SSH Key", self.user_ssh_key, ["user", "ssh_public_key"], as_dict=True)
+		if not key or key.user != self.user or key.ssh_public_key != self.ssh_public_key:  # type: ignore[union-attr]
+			frappe.throw(
+				_("You can only issue an SSH certificate for an SSH key of your own."), frappe.PermissionError
+			)
+
+	def validate_single_server(self):
+		if self.all_servers:
+			frappe.throw(
+				_("Only System Managers can issue an SSH certificate for all servers."),
+				frappe.PermissionError,
+			)
+		if not (self.server_type and self.access_server):
+			frappe.throw(_("Select the server that the SSH certificate is for."), frappe.PermissionError)
+
+	def validate_server_role(self, roles: list[str]):
+		if "Press Hybrid Server Manager" in roles and self.is_self_hosted_server():
+			return
+		if "Press Infrastructure Manager" in roles:
+			check_server_access(self.server_type, str(self.access_server))
+		elif "Press Hybrid Server Manager" in roles:
+			frappe.throw(
+				_(
+					"Press Hybrid Server Manager reaches only self-hosted servers. {0} {1} is not self-hosted."
+				).format(self.server_type, self.access_server),
+				frappe.PermissionError,
+			)
+		else:
+			frappe.throw(
+				_(
+					"You need the Press Infrastructure Manager or Press Hybrid Server Manager role to issue an SSH certificate."
+				),
+				frappe.PermissionError,
+			)
+
+	def is_self_hosted_server(self) -> bool:
+		return bool(frappe.db.get_value(self.server_type, self.access_server, "is_self_hosted"))
 
 	def before_insert(self):
 		if frappe.get_all(
@@ -63,7 +118,9 @@ class UserSSHCertificate(Document):
 				"docstatus": 1,
 			},
 		):
-			frappe.throw("A valid certificate already exists.")
+			frappe.throw(
+				"You already have a valid SSH certificate for this server. Please use the existing certificate, or wait for it to expire before requesting a new one."
+			)
 
 	def before_save(self):
 		# decode the ssh key and generate a fingerprint
@@ -88,22 +145,15 @@ class UserSSHCertificate(Document):
 			public_key.write(self.ssh_public_key)
 			public_key.flush()
 
-		if self.all_servers:
-			principal = "all-servers"
-		else:
-			principal = self.access_server
+		principal = self.get_principals()
 
 		# try generating a certificate for the /tmp key.
 		try:
-			command = (
-				f"ssh-keygen -s ca -I {self.name} -n {principal} -V +{self.validity} {tmp_pub_file}"
-			)
+			command = f"ssh-keygen -s ca -I {self.name} -n {principal} -V +{self.validity} {tmp_pub_file}"
 			subprocess.check_output(shlex.split(command), cwd="/etc/ssh")
 		except subprocess.CalledProcessError as e:
 			log_error("SSH Certificate Generation Error", exception=e)
-			frappe.throw(
-				"Failed to generate a certificate for the specified key. Please try again."
-			)
+			frappe.throw("Failed to generate a certificate for the specified key. Please try again.")
 		process = subprocess.Popen(
 			shlex.split(f"ssh-keygen -Lf {tmp_pub_file_prefix}-cert.pub"),
 			stdout=subprocess.PIPE,
@@ -123,17 +173,37 @@ class UserSSHCertificate(Document):
 
 	def generate_ssh_command(self):
 		server = self.access_server
+		proxy = getattr(self, "proxy", None)
 		if not server:
-			server = "<server you want>"
+			server = "<server>"
+			proxy = "<proxy>"
 
 		ssh_port = 22
-		ssh_user = "frappe"
-		self.ssh_command = f"ssh {server} -p {ssh_port} -l {ssh_user}"
+		if self.server_type == "Proxy Server" or not proxy:
+			self.ssh_command = f"ssh frappe@{server} -p {ssh_port}"
+		else:
+			self.ssh_command = f"ssh -J frappe@{proxy} frappe@{server} -p {ssh_port}"
+
+	def get_principals(self):
+		if self.all_servers:
+			return "all-servers"
+
+		if self.server_type == "Proxy Server":
+			return self.access_server
+
+		if self.server_type == "Server":
+			self.proxy = frappe.db.get_value("Server", self.access_server, "proxy_server")
+		elif self.server_type == "Database Server":
+			self.proxy = frappe.db.get_value(
+				"Server", {"status": "Active", "database_server": self.access_server}, "proxy_server"
+			)
+
+		return f"{self.proxy},{self.access_server}" if self.proxy else self.access_server
 
 
 @frappe.whitelist()
 def read_certificate(key_type, docname):
-	with open("/tmp/id_{0}-{1}-cert.pub".format(key_type, docname)) as certificate:
+	with open(f"/tmp/id_{key_type}-{docname}-cert.pub") as certificate:
 		try:
 			return certificate.read()
 		except Exception:

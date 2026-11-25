@@ -6,11 +6,12 @@ import ipaddress
 import frappe
 from frappe import _
 from frappe.model.document import Document
+from frappe.utils import cstr
 
 from press.overrides import has_permission as has_press_permission
 from press.press.doctype.server.server import Server
 from press.runner import Ansible
-from press.utils import get_current_team, log_error
+from press.utils import log_error
 
 
 class ServerFirewall(Document):
@@ -36,15 +37,12 @@ class ServerFirewall(Document):
 		"rules",
 	)
 
-	@staticmethod
-	def get_list_query(query):
-		"""Filter list query to only show firewalls belonging to the current team."""
-		Server = frappe.qb.DocType("Server")
-		Firewall = frappe.qb.DocType("Server Firewall")
-		current_team = get_current_team()
-		return (
-			query.inner_join(Server).on(Server.name == Firewall.server_id).where(Server.team == current_team)
-		)
+	# The firewall page is an editor: it flips the switch and rewrites the rules
+	# table, then saves both through `set_value`.
+	dashboard_editable_fields = (
+		"enabled",
+		"rules",
+	)
 
 	def before_validate(self):
 		self.deduplicate_rules()
@@ -80,6 +78,8 @@ class ServerFirewall(Document):
 			self.validate_port(rule.port)
 
 	def on_update(self):
+		if self.get_doc_before_save() is None:
+			return
 		self.sync()
 
 	@frappe.whitelist()
@@ -121,10 +121,13 @@ class ServerFirewall(Document):
 
 	def _sync_nginx(self):
 		"""Update Nginx access rules with allowed and denied IPs."""
+		server = self.server
 		ip_accept = self.get_allowed_ips_for_nginx()
 		ip_drop = [rule.source for rule in self.rules if rule.action == "Deny" and rule.source]
 		try:
-			return self.server.agent.update_nginx_access(ip_accept, ip_drop)
+			# The proxy IP travels with the rules: nginx needs it to read the
+			# visitor's address off X-Real-IP instead of matching the proxy.
+			return server.agent.update_nginx_access(ip_accept, ip_drop, server.get_proxy_ip())
 		except Exception:
 			log_error("Failed to sync nginx access rules", doc=self)
 
@@ -170,16 +173,10 @@ class ServerFirewall(Document):
 		ips = frappe.get_all("Monitor Server", pluck="ip")
 		if proxy_ip := self.server.get_proxy_ip():
 			ips.append(proxy_ip)
-		if nat_ip := self.server.get_nat_ip():
-			ips.append(nat_ip)
-		if self.production_ip:
-			ips.append(self.production_ip)
+		if nat_ip := self.server.get_nat_gateway_ip():
+			ips.append(str(ipaddress.ip_network(nat_ip + "/24", strict=False)))
+		ips.extend(production_ips())
 		return ips
-
-	@property
-	def production_ip(self) -> str | None:
-		"""Return the production server IP from Press Settings."""
-		return frappe.db.get_single_value("Press Settings", "production_server_ip", cache=True)
 
 	@property
 	def server(self) -> Server:
@@ -190,6 +187,17 @@ class ServerFirewall(Document):
 def has_permission(doc, user=None, permission_type=None) -> bool:
 	"""Check if the user has permission to access this firewall's server."""
 	return has_press_permission(doc.server, permission_type, user)
+
+
+def production_ips() -> list[str]:
+	"""Return the IPs of the Press production host from Press Settings, one per line."""
+	return cstr(frappe.db.get_single_value("Press Settings", "production_server_ip", cache=True)).split()
+
+
+def sync_enabled_firewalls():
+	"""Sync each enabled firewall, so that its allow lists have the current production IPs."""
+	for name in frappe.get_all("Server Firewall", {"enabled": 1}, pluck="name"):
+		frappe.get_doc("Server Firewall", name).sync()
 
 
 def from_server(doc, method=None) -> ServerFirewall | None:

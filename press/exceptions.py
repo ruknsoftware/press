@@ -103,3 +103,15 @@ class ArchiveBenchError(ValidationError):
 
 class MonitorServerDown(ValidationError):
 	pass
+
+
+class ReleasePipelineFailure(Exception):
+	pass
+
+
+class SiteBackupInProgress(ValidationError):
+	pass
+
+
+class SiteUpdateInProgress(ValidationError):
+	pass

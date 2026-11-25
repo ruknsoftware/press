@@ -33,7 +33,7 @@
 
 					<div
 						v-if="!searchQuery.length"
-						class="text-xs font-medium text-gray-500 py-2 pl-2"
+						class="text-xs font-medium text-ink-gray-5 py-2 pl-2"
 					>
 						Recent
 					</div>
@@ -45,7 +45,7 @@
 						v-for="option in displayedOptions"
 						:key="option.value"
 						@click="!option.is_yanked && selectOption(option, togglePopover)"
-						class="flex cursor-pointer items-center justify-between rounded px-2.5 py-1.5 text-base hover:bg-gray-50"
+						class="flex cursor-pointer items-center justify-between rounded px-2.5 py-1.5 text-base hover:bg-surface-gray-1"
 						:class="{
 							'bg-surface-gray-3': isSelected(option),
 							'opacity-50 cursor-not-allowed': option.is_yanked,
@@ -76,6 +76,12 @@
 								{{ option.label }}
 							</span>
 							<span
+								v-if="option.is_mandatory"
+								class="text-xs text-blue-500 font-medium"
+							>
+								Mandatory
+							</span>
+							<span
 								v-if="option.is_yanked"
 								class="text-xs text-red-500 font-medium"
 							>
@@ -83,7 +89,7 @@
 							</span>
 						</div>
 					</div>
-					<div class="*:text-center *:mb-2 *:mt-3 *:text-xs *:text-gray-400">
+					<div class="*:text-center *:mb-2 *:mt-3 *:text-xs *:text-ink-gray-4">
 						<div v-if="$resources.releases.loading && !!searchQuery.length">
 							Searching...
 						</div>
@@ -96,9 +102,8 @@
 </template>
 
 <script>
-import { Popover, Button, debounce } from 'frappe-ui';
-import FormControl from 'frappe-ui/src/components/FormControl/FormControl.vue';
-import { nextTick } from 'vue';
+import { Button, debounce, FormControl, Popover } from 'frappe-ui'
+import { nextTick } from 'vue'
 
 export default {
 	name: 'CommitChooser',
@@ -110,7 +115,7 @@ export default {
 		return {
 			searchQuery: '',
 			queryResult: [],
-		};
+		}
 	},
 	props: [
 		'options',
@@ -130,26 +135,26 @@ export default {
 				value: option.value,
 				hash: option.hash,
 				timestamp: option.timestamp,
-			});
-			togglePopover();
+			})
+			togglePopover()
 		},
 		isSelected(option) {
-			return this.modelValue?.value === option.value;
+			return this.modelValue?.value === option.value
 		},
 		isVersion(tag) {
-			return tag.match(/^v\d+\.\d+\.\d+$/);
+			return tag.match(/^v\d+\.\d+\.\d+$/)
 		},
 		onQueryChange() {
 			debounce(() => {
-				this.$resources.releases.reload();
-			}, 300)();
+				this.$resources.releases.reload()
+			}, 300)()
 		},
 		focusSearch() {
 			nextTick(() => {
 				// Focus the input element inside popover FormControl
-				const el = this.$refs.searchInput?.$el?.querySelector('input');
-				el?.focus();
-			});
+				const el = this.$refs.searchInput?.$el?.querySelector('input')
+				el?.focus()
+			})
 		},
 	},
 	resources: {
@@ -160,7 +165,6 @@ export default {
 					app: this.app,
 					source: this.source,
 					query: this.searchQuery?.trim(),
-					fields: ['name', 'message', 'timestamp', 'hash'],
 					current_release: this.currentRelease,
 					limit: 20,
 				},
@@ -171,25 +175,25 @@ export default {
 						value: release.name,
 						timestamp: release.timestamp,
 						hash: release.hash,
-					}));
+					}))
 				},
-			};
+			}
 		},
 	},
 	computed: {
 		displayedOptions() {
 			return this.searchQuery.length
 				? this.$resources.releases.data
-				: this.options;
+				: this.options
 		},
 	},
 	watch: {
 		searchQuery(newQuery) {
 			if (newQuery.length === 0) {
-				this.queryResult = [];
-				return;
+				this.queryResult = []
+				return
 			}
 		},
 	},
-};
+}
 </script>

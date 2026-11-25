@@ -1,11 +1,12 @@
 <template>
+	<ErrorMessage class="m-2" :message="$resources.changeSitePlan.error" />
 	<div class="grid grid-cols-2 gap-2 sm:grid-cols-3">
 		<div
 			v-for="plan in subscription.plans"
-			class="m-2 flex flex-col justify-between rounded-2xl border border-gray-100 p-4 shadow"
+			class="m-2 flex flex-col justify-between rounded-2xl border border-outline-gray-1 p-4 shadow"
 		>
 			<div>
-				<h4 class="flex justify-between text-xl font-semibold text-gray-900">
+				<h4 class="flex justify-between text-xl font-semibold text-ink-gray-9">
 					<div>
 						<span>
 							{{
@@ -13,7 +14,7 @@
 									? '₹' + plan.price_inr
 									: '$' + plan.price_usd
 							}}
-							<span class="text-base font-normal text-gray-600">
+							<span class="text-base font-normal text-ink-gray-6">
 								{{ plan.block_monthly === 1 ? '/year' : '/mo' }}
 							</span>
 						</span>
@@ -61,6 +62,9 @@ export default {
 		changeSitePlan() {
 			return {
 				url: 'press.api.developer.marketplace.change_site_plan',
+				onSuccess: () => {
+					this.$emit('update:step', 4);
+				},
 			};
 		},
 	},
@@ -75,7 +79,6 @@ export default {
 						secret_key: this.secretKey,
 						plan: plan.name,
 					});
-					this.$emit('update:step', 4);
 				} else {
 					this.$emit('update:step', 3);
 				}
@@ -89,7 +92,7 @@ export default {
 					this.$plural(plan.cpu_time_per_day, 'hour', 'hours') +
 					' CPU per day',
 				this.formatBytes(plan.max_database_usage, 0, 2) + ' Database',
-				this.formatBytes(plan.max_storage_usage, 0, 2) + ' Storge',
+				this.formatBytes(plan.max_storage_usage, 0, 2) + ' Storage',
 			];
 			if (plan.support_included) {
 				features.push('Product warranty + Support');

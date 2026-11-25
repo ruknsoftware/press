@@ -84,10 +84,22 @@ class BenchUpdate(Document):
 				frappe.ValidationError,
 			)
 
-	def deploy(self, run_will_fail_check=False) -> str:
+	def deploy(
+		self,
+		run_will_fail_check=False,
+		validate_pre_candidate_checks: bool = True,
+		create_build: bool = True,
+		ignore_permissions: bool = False,
+		trigger_patch_deploy: bool = False,
+	) -> str:
+		"""Creates and returns candidate name or build name depending on the point of invocation."""
 		rg: ReleaseGroup = frappe.get_doc("Release Group", self.group)
-		candidate = rg.create_deploy_candidate(self.apps, run_will_fail_check)
-		deploy = candidate.schedule_build_and_deploy()
+		candidate = rg.create_deploy_candidate(
+			apps_to_update=self.apps,
+			run_will_fail_check=run_will_fail_check,
+			validate_pre_candidate_checks=validate_pre_candidate_checks,
+			ignore_permissions=ignore_permissions,
+		)
 
 		self.candidate = candidate.name
 		self.save()
@@ -95,6 +107,22 @@ class BenchUpdate(Document):
 		if not isinstance(candidate.name, str):
 			raise Exception(
 				f"Invalid name found for deploy candidate '{candidate.name}' of type {type(candidate.name)}"
+			)
+
+		if not create_build:
+			# In case we are not scheduling build from here (eg. new build flow) return candidate name here
+			return candidate.name
+
+		deploy = (
+			candidate.schedule_build_and_deploy(ignore_permissions=ignore_permissions)
+			if not trigger_patch_deploy
+			else candidate.trigger_patch_deploy(ignore_permissions=ignore_permissions)
+		)
+
+		# Trigger patch deploy can return error if the builds are suspended
+		if deploy.get("error"):
+			raise Exception(
+				deploy.get("message", "Build could not be initiated for the deploy candidate."),
 			)
 
 		return deploy["name"]
@@ -164,15 +192,17 @@ def get_bench_update(
 	apps: list,
 	sites: list | None = None,
 	is_inplace_update: bool = False,
+	ignore_permissions: bool = False,
 ) -> BenchUpdate:
 	if sites is None:
 		sites = []
 
-	current_team = get_current_team()
-	rg_team = frappe.db.get_value("Release Group", name, "team")
+	if not ignore_permissions:
+		current_team = get_current_team()
+		rg_team = frappe.db.get_value("Release Group", name, "team")
 
-	if rg_team != current_team:
-		frappe.throw("Bench can only be deployed by the bench owner", exc=frappe.PermissionError)
+		if rg_team != current_team:
+			frappe.throw("Bench can only be deployed by the bench owner", exc=frappe.PermissionError)
 
 	bench_update: "BenchUpdate" = frappe.get_doc(
 		{
@@ -192,4 +222,5 @@ def get_bench_update(
 			"is_inplace_update": is_inplace_update,
 		}
 	).insert(ignore_permissions=True)
+
 	return bench_update

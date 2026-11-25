@@ -45,7 +45,7 @@ def create_dns_record(doc, record_name=None):
 		# Check if the cluster has multiple proxy servers
 		proxy_servers = frappe.get_all(
 			"Proxy Server",
-			{"cluster": doc.cluster, "status": "Active"},
+			{"cluster": doc.cluster, "status": "Active", "exclude_from_auto_selection": 0},
 			pluck="name",
 		)
 		if len(proxy_servers) == 1 or (
@@ -83,20 +83,17 @@ def _change_dns_record(method: str, domain: RootDomain, proxy_server: str, recor
 	try:
 		zones = client.list_hosted_zones_by_name()["HostedZones"]
 		hosted_zone = find(reversed(zones), lambda x: domain.name.endswith(x["Name"][:-1]))["Id"]
+		record = {
+			"Name": record_name,
+			"Type": "CNAME",
+			"TTL": 600,
+			"ResourceRecords": [{"Value": proxy_server}],
+		}
+		if method == "DELETE" and record_name:
+			# Route 53 deletes only on an exact match, and older records have other TTLs
+			record = _find_cname_record(client, hosted_zone, record_name, proxy_server) or record
 		client.change_resource_record_sets(
-			ChangeBatch={
-				"Changes": [
-					{
-						"Action": method,
-						"ResourceRecordSet": {
-							"Name": record_name,
-							"Type": "CNAME",
-							"TTL": 600,
-							"ResourceRecords": [{"Value": proxy_server}],
-						},
-					}
-				]
-			},
+			ChangeBatch={"Changes": [{"Action": method, "ResourceRecordSet": record}]},
 			HostedZoneId=hosted_zone,
 		)
 	except client.exceptions.InvalidChangeBatch as e:
@@ -118,6 +115,24 @@ def _change_dns_record(method: str, domain: RootDomain, proxy_server: str, recor
 			site=record_name,
 			proxy_server=proxy_server,
 		)
+
+
+def _find_cname_record(client, hosted_zone: str, record_name: str, target: str) -> dict | None:
+	"""Return the CNAME record set for `record_name` as Route 53 has it, if it points at `target`."""
+	records = client.list_resource_record_sets(
+		HostedZoneId=hosted_zone, StartRecordName=record_name, StartRecordType="CNAME", MaxItems="1"
+	)["ResourceRecordSets"]
+	if not records:
+		return None
+	record = records[0]
+	values = [value["Value"].rstrip(".") for value in record.get("ResourceRecords", [])]
+	if (
+		record["Name"].rstrip(".") == record_name.rstrip(".")
+		and record["Type"] == "CNAME"
+		and values == [target.rstrip(".")]
+	):
+		return record
+	return None
 
 
 def get_dns_provider_mname_rname(domain):
@@ -145,7 +160,7 @@ def accessible_link_substr(provider: str):
 	except requests.RequestException:
 		return None
 	else:
-		return f'<a class=underline href="http://{provider}" target="_blank">{provider}</a>'
+		return f'<a class="underline" href="http://{provider}" target="_blank">{provider}</a>'
 
 
 @redis_cache()
@@ -224,16 +239,21 @@ def check_for_ip_match(site_name: str, site_ip: str | None, domain_ip: str | Non
 	if domain_ip == site_ip:
 		return True
 	if site_ip:
-		# We can issue certificates even if the domain points to the secondary proxies
-		server = frappe.db.get_value("Site", site_name, "server")
+		# We can issue certificates even if the domain points to the secondary or failed over proxies
+		server, cluster = frappe.db.get_value("Site", site_name, ["server", "cluster"])
 		proxy = frappe.db.get_value("Server", server, "proxy_server")
+		proxy_ip = frappe.db.get_value("Proxy Server", proxy, "ip")
 		secondary_ips = frappe.get_all(
 			"Proxy Server",
 			{"status": "Active", "primary": proxy, "is_replication_setup": True},
 			pluck="ip",
 		)
-		if domain_ip in secondary_ips:
-			return True
+		failed_over_ips = frappe.get_all(
+			"Proxy Server",
+			{"status": "Active", "cluster": cluster, "is_primary": True, "exclude_from_auto_selection": True},
+			pluck="ip",
+		)
+		return domain_ip in [*secondary_ips, proxy_ip, *failed_over_ips]
 	return False
 
 

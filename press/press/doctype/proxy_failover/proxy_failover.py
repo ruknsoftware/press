@@ -48,7 +48,9 @@ class ProxyFailover(Document, StepHandler):
 		)
 
 		if secondary.cluster != primary.cluster:
-			frappe.throw("Failover can only be initiated between Proxy Servers in the same cluster")
+			frappe.throw(
+				"Failover can only be initiated between proxy servers in the same cluster. Please choose a target proxy server in the same cluster."
+			)
 
 		if (not primary.is_static_ip and not secondary.is_static_ip) or (
 			primary.is_static_ip and secondary.is_static_ip
@@ -460,10 +462,6 @@ class ProxyFailover(Document, StepHandler):
 		except Exception as e:
 			self._fail_ansible_step(step, ansible, e)
 			# not really that big of an issue if we couldn't remove access (if the replication was stopped properly)
-
-	def handle_step_failure(self):
-		self.error = frappe.get_traceback(with_context=True)
-		self.save()
 
 	@frappe.whitelist()
 	def force_continue(self):

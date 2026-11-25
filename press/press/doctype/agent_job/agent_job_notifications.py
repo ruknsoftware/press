@@ -2,6 +2,7 @@
 # For license information, please see license.txt
 from __future__ import annotations
 
+import re
 import typing
 from enum import Enum, auto
 from typing import Protocol, TypedDict
@@ -31,6 +32,12 @@ class Details(TypedDict):
 
 # These strings are checked against the traceback or output of the job
 MatchStrings = str | list[str]
+
+# Bench app directory in a traceback frame, app names are python module names
+APP_FRAME = re.compile(r"/apps/([a-z_][a-z0-9_]*)/")
+
+# Path in the error that Frappe raises when it tries to delete a folder as an old backup file
+BACKUP_FOLDER_PATH = re.compile(r"IsADirectoryError: .*?'([^']*/private/backups/[^']+)'")
 
 if typing.TYPE_CHECKING:
 	# TYPE_CHECKING guard for code below cause DeployCandidate
@@ -62,6 +69,9 @@ class JobErr(Enum):
 	GZIP_TAR_ERR = auto()
 	UNKNOWN_COMMAND_HYPHEN = auto()
 	RQ_JOBS_IN_QUEUE = auto()
+	APP_UPDATE = auto()
+	APP_DEBUG = auto()
+	PKG_RESOURCES = auto()
 
 
 DOC_URLS = {
@@ -71,9 +81,12 @@ DOC_URLS = {
 	JobErr.BROKEN_PIPE_ERR: None,
 	JobErr.CANT_CONNECT_TO_MYSQL: "https://docs.frappe.io/cloud/cant-connect-to-mysql-server",
 	JobErr.LOST_CONN_TO_MYSQL: "https://docs.frappe.io/cloud/site/common-issues/lost-connection-to-mysql-server",
-	JobErr.GZIP_TAR_ERR: "https://docs.frappe.io/cloud/sites/migrate-an-existing-site#tar-gzip-command-fails-with-unexpected-eof",
+	JobErr.GZIP_TAR_ERR: "https://docs.frappe.io/cloud/sites/migrate-an-existing-site#targzip-command-fails-with-unexpected-eof",
 	JobErr.UNKNOWN_COMMAND_HYPHEN: "https://docs.frappe.io/cloud/unknown-command-",
-	JobErr.RQ_JOBS_IN_QUEUE: "https://docs.frappe.io/cloud/faq/site#how-do-i-deactivate-my-site-",
+	JobErr.RQ_JOBS_IN_QUEUE: "https://docs.frappe.io/cloud/faq/site#how-do-i-deactivate-my-site",
+	JobErr.APP_UPDATE: "https://docs.frappe.io/cloud/benches/updating_a_bench",
+	JobErr.APP_DEBUG: "https://frappecloud.com/docs/benches/debugging",
+	JobErr.PKG_RESOURCES: "https://docs.frappe.io/cloud/private-benches/common-issues/pkg-resources-error-when-updating-site",
 }
 
 
@@ -106,11 +119,15 @@ def handlers() -> list[UserAddressableHandlerTuple]:
 		("BrokenPipeError", update_with_broken_pipe_err),
 		("ERROR 2002 (HY000)", update_with_cant_connect_to_mysql_err),
 		("Lost connection to server during query", update_with_lost_conn_to_mysql_err),
+		("Lost connection to MySQL server during query", update_with_lost_conn_to_mysql_err),
 		("gzip: stdin: unexpected end of file", update_with_gzip_tar_err),
 		("tar: Unexpected EOF in archive", update_with_gzip_tar_err),
 		("Unknown command '\\-'.", update_with_unknown_command_hyphen_err),
 		('redis_host, redis_port = redis_url.split(":")', update_with_redis_unpack_error),
 		("Site might have lot of jobs in queue.", update_with_rq_jobs_in_queue_err),
+		(["IsADirectoryError", "/private/backups/"], update_with_folder_in_backups_err),
+		# Keep last: matches any traceback, only actionable if the failing app is identifiable
+		("/apps/", update_with_app_failure_err),
 	]
 
 
@@ -161,6 +178,11 @@ def get_details(job: AgentJob, title: str, message: str) -> Details:
 		assistance_url=None,
 	)
 
+	# Not a string match against the traceback/output, so it is checked separately.
+	if update_with_skipped_backups_update_failure(details, job):
+		details["is_actionable"] = True
+		return details
+
 	for strs, handler in handlers():
 		if isinstance(strs, str):
 			strs = [strs]
@@ -183,18 +205,41 @@ def get_details(job: AgentJob, title: str, message: str) -> Details:
 	return details
 
 
+def update_with_skipped_backups_update_failure(details: Details, job: AgentJob) -> bool:
+	"""A site update run with backups skipped can fail mid-migration and leave the
+	site's database in a partially migrated state. There is no backup to roll back
+	to, so the site cannot be recovered automatically and the user has to fix it
+	manually over SSH."""
+	if job.job_type not in ("Update Site Migrate", "Update Site Pull"):
+		return False
+
+	if not frappe.db.exists("Site Update", {"update_job": job.name, "skipped_backups": 1}):
+		return False
+
+	details["title"] = "Site update failed and cannot be recovered automatically"
+	details["message"] = (
+		f"<p>The update for site <b>{job.site}</b> failed.</p>"
+		"<p>Because this update was run with backups skipped, there is no backup to restore from and"
+		" the site cannot be recovered automatically. The database may be left in a partially"
+		" migrated state.</p>"
+		'<p>Please <a class="underline" href="https://docs.frappe.io/cloud/benches/ssh">connect to the'
+		" bench over SSH</a> and fix the site manually.</p>"
+	)
+
+	return True
+
+
 def update_with_oom_err(
 	details: Details,
 	job: AgentJob,
 ):
 	details["title"] = "Server out of memory error"
 
-	details[
-		"message"
-	] = f"""<p>The server ran out of memory while {job.job_type} job was running and was killed by the system.</p>
-	<p>It is recommended to increase the memory available for the server <a class="underline" href="/dashboard/servers/{job.server}">{job.server}</a>.</p>
-	<p>To rectify this issue, please follow the steps mentioned in <i>Help</i>.</p>
-	"""
+	details["message"] = (
+		f"<p>The server ran out of memory while {job.job_type} job was running and was killed by the system.</p>"
+		f'<p>It is recommended to increase the memory available for the server <a class="underline" href="/dashboard/servers/{job.server}">{job.server}</a>.</p>'
+		"<p>To rectify this issue, please follow the steps mentioned in <i>Help</i>.</p>"
+	)
 
 	details["assistance_url"] = DOC_URLS[JobErr.OOM]
 
@@ -207,12 +252,11 @@ def update_with_oom_err(
 def update_with_row_size_too_large_err(details: Details, job: AgentJob):
 	details["title"] = "Row size too large error"
 
-	details[
-		"message"
-	] = f"""<p>The server encountered a row size too large error while migrating the site <b>{job.site}</b>.</p>
-	<p>This tends to happen on doctypes with many custom fields</p>
-	<p>To rectify this issue, please follow the steps mentioned in <i>Help</i>.</p>
-	"""
+	details["message"] = (
+		f"<p>The server encountered a row size too large error while migrating the site <b>{job.site}</b>.</p>"
+		"<p>This tends to happen on doctypes with many custom fields</p>"
+		"<p>To rectify this issue, please follow the steps mentioned in <i>Help</i>.</p>"
+	)
 
 	details["assistance_url"] = DOC_URLS[JobErr.ROW_SIZE_TOO_LARGE]
 
@@ -222,12 +266,11 @@ def update_with_row_size_too_large_err(details: Details, job: AgentJob):
 def update_with_data_truncated_for_column_err(details: Details, job: AgentJob):
 	details["title"] = "Data truncated for column error"
 
-	details[
-		"message"
-	] = f"""<p>The server encountered a data truncated for column error while migrating the site <b>{job.site}</b>.</p>
-	<p>This tends to happen when the datatype of a field changes, but there is existing data in the doctype that don't fit to the new datatype</p>
-	<p>To rectify this issue, please follow the steps mentioned in <i>Help</i>.</p>
-	"""
+	details["message"] = (
+		f"<p>The server encountered a data truncated for column error while migrating the site <b>{job.site}</b>.</p>"
+		"<p>This tends to happen when the datatype of a field changes, but there is existing data in the doctype that don't fit to the new datatype</p>"
+		"<p>To rectify this issue, please follow the steps mentioned in <i>Help</i>.</p>"
+	)
 
 	details["assistance_url"] = DOC_URLS[JobErr.DATA_TRUNCATED_FOR_COLUMN]
 
@@ -254,11 +297,10 @@ def update_with_broken_pipe_err(details: Details, job: AgentJob):
 
 	details["title"] = "Job failed due to maintenance activity on the server"
 
-	details[
-		"message"
-	] = f"""<p>The ongoing job coincided with a maintenance activity on the server <b>{job.server}</b> and hence failed.</p>
-	<p>Please try again in a few minutes.</p>
-	"""
+	details["message"] = (
+		f"<p>The ongoing job coincided with a maintenance activity on the server <b>{job.server}</b> and hence failed.</p>"
+		"<p>Please try again in a few minutes.</p>"
+	)
 
 	return True
 
@@ -270,11 +312,10 @@ def update_with_cant_connect_to_mysql_err(details: Details, job: AgentJob):
 	if job.on_public_server:
 		suggestion = "Please raise a support ticket if the issue persists."
 
-	details[
-		"message"
-	] = f"""<p>The server couldn't connect to MySQL server during the job. This likely happened as the mysql server restarted as it didn't have sufficient memory for the operation. Please retry.</p>
-	<p>{suggestion}</p>
-	"""
+	details["message"] = (
+		"<p>The server couldn't connect to MySQL server during the job. This likely happened as the mysql server restarted as it didn't have sufficient memory for the operation. Please retry.</p>"
+		f"<p>{suggestion}</p>"
+	)
 
 	details["assistance_url"] = DOC_URLS[JobErr.CANT_CONNECT_TO_MYSQL]
 
@@ -284,17 +325,14 @@ def update_with_cant_connect_to_mysql_err(details: Details, job: AgentJob):
 def update_with_lost_conn_to_mysql_err(details: Details, job: AgentJob):
 	details["title"] = "Lost connection to MySQL server during query"
 
-	suggestion = (
-		"If the issue persists, please follow the steps mentioned in <i>Help</i> to rectify this issue"
-	)
+	suggestion = "If the issue persists, please consider upgrading the Database server for more memory. Please follow the steps mentioned in <i>Help</i> for instructions on how to upgrade the database server."
 	if job.on_public_server:
 		suggestion = "Please raise a support ticket if the issue persists."
 
-	details[
-		"message"
-	] = f"""<p>The server lost connection to MySQL server during the job. This likely happened as the mysql server restarted as it didn't have sufficient memory for the operation. Please retry.</p>
-	<p>{suggestion}</p>
-	"""
+	details["message"] = (
+		"<p>The server lost connection to MySQL server during the job. This likely happened as the mysql server restarted as it didn't have sufficient memory for the operation. Please retry.</p>"
+		f"<p>{suggestion}</p>"
+	)
 
 	details["assistance_url"] = DOC_URLS[JobErr.LOST_CONN_TO_MYSQL]
 
@@ -304,9 +342,10 @@ def update_with_lost_conn_to_mysql_err(details: Details, job: AgentJob):
 def update_with_gzip_tar_err(details: Details, job: AgentJob):
 	details["title"] = "Corrupt backup file"
 
-	details["message"] = f"""<p>An error occurred when extracting the backup to {job.site}.</p>
-	<p>To rectify this issue, please follow the steps mentioned in <i>Help</i>.</p>
-	"""
+	details["message"] = (
+		f"<p>An error occurred when extracting the backup to {job.site}.</p>"
+		"<p>To rectify this issue, please follow the steps mentioned in <i>Help</i>.</p>"
+	)
 
 	details["assistance_url"] = DOC_URLS[JobErr.GZIP_TAR_ERR]
 
@@ -316,10 +355,11 @@ def update_with_gzip_tar_err(details: Details, job: AgentJob):
 def update_with_unknown_command_hyphen_err(details: Details, job: AgentJob):
 	details["title"] = "Incompatible site backup"
 
-	details["message"] = f"""<p>An error occurred when extracting the backup to {job.site}.</p>
-	<p>This happens when the backup is taken from a later version of MariaDB and restored on a older version.</p>
-	<p>To rectify this issue, please follow the steps mentioned in <i>Help</i>.</p>
-	"""
+	details["message"] = (
+		f"<p>An error occurred when extracting the backup to {job.site}.</p>"
+		"<p>This happens when the backup is taken from a later version of MariaDB and restored on a older version.</p>"
+		"<p>To rectify this issue, please follow the steps mentioned in <i>Help</i>.</p>"
+	)
 
 	details["assistance_url"] = DOC_URLS[JobErr.UNKNOWN_COMMAND_HYPHEN]
 
@@ -327,22 +367,145 @@ def update_with_unknown_command_hyphen_err(details: Details, job: AgentJob):
 
 
 def update_with_rq_jobs_in_queue_err(details: Details, job: AgentJob):
-	if job.job_type not in ["Update Site Pull", "Update Site Migrate"]:
+	if job.job_type not in ["Update Site Pull", "Update Site Migrate", "Deactivate Site"]:
 		return False
 
 	details["title"] = "High number of queued jobs"
 
-	details["message"] = """<p>The job could not be processed because there are too many jobs getting queued.
-	If this continues to happen upon retry, please <b>deactivate</b> your site, wait for 5 minutes and try again. You may activate it again once the update is finished</p>
-	<p>Click <i>help</i> for instructions on how to deactivate your site.</p>
-
-
-	<p><b>NOTE</b>: This will cause downtime for that duration</p>
-	"""
+	details["message"] = (
+		"<p>The job could not be processed because there are too many jobs getting queued."
+		" If this continues to happen upon retry, please <b>deactivate</b> your site, wait for some time (5-10 minutes) and try again. You may activate it again once the update is finished</p>"
+		"<p>Click <i>help</i> for instructions on how to deactivate your site.</p>"
+		"<p><b>NOTE</b>: This will cause downtime for that duration</p>"
+	)
 
 	details["assistance_url"] = DOC_URLS[JobErr.RQ_JOBS_IN_QUEUE]
 
 	return True
+
+
+def update_with_folder_in_backups_err(details: Details, job: AgentJob):
+	"""Frappe deletes old files in private/backups before a backup, and fails on a folder"""
+	details["title"] = "Backup failed because of a folder in the backups folder"
+
+	details["message"] = (
+		f"<p>The backup of site <b>{job.site}</b> failed because of the folder <code>{get_backup_folder_path(job)}</code>.</p>"
+		"<p>Before each backup, Frappe deletes old files in the <code>private/backups</code> folder of the site."
+		" It cannot delete a folder, so the backup stops.</p>"
+		"<p>Delete all folders in <code>private/backups</code>, or move them to a different location. Then take the backup again."
+		" If an app or a script makes these folders, change it to use a different location.</p>"
+	)
+
+	return True
+
+
+def get_backup_folder_path(job: AgentJob) -> str:
+	match = BACKUP_FOLDER_PATH.search(f"{job.traceback or ''}\n{job.output or ''}")
+	return match.group(1) if match else "private/backups"
+
+
+def has_newer_release(bench: str | None, app: str) -> bool:
+	"""False only if we know the bench is on the newest release of the app"""
+	deployed = frappe.db.get_value(
+		"Bench App", {"parent": bench, "app": app}, ["source", "release"], as_dict=True
+	)
+	if not deployed:
+		return True
+
+	latest = frappe.db.get_value(
+		"App Release", {"source": deployed.source, "status": "Approved"}, "name", order_by="creation desc"
+	)
+	return latest != deployed.release
+
+
+def update_with_app_failure_err(details: Details, job: AgentJob):
+	if job.job_type not in ["Update Site Migrate", "Update Site Pull"]:
+		return False
+
+	app_and_source = get_failing_app_and_source(job)
+	if not app_and_source:
+		return False
+
+	app, source = app_and_source
+	details["title"] = f"Update failed because of the {app} app"
+
+	if is_missing_pkg_resources(job):
+		return update_with_missing_pkg_resources_message(details, job, app)
+	if is_owned_by_site_team(source, job):
+		return update_with_debug_your_app_message(details, job, app)
+	return update_with_check_for_update_message(details, job, app)
+
+
+def is_missing_pkg_resources(job: AgentJob) -> bool:
+	return "No module named 'pkg_resources'" in f"{job.traceback or ''}\n{job.output or ''}"
+
+
+def update_with_missing_pkg_resources_message(details: Details, job: AgentJob, app: str) -> bool:
+	"""Documented cause with documented workarounds, so it beats the generic advice"""
+	details[
+		"message"
+	] = f"""<p>The update of site <b>{job.site}</b> failed because <b>{app}</b> (or one of its dependencies) imports <code>pkg_resources</code>, which newer versions of <b>setuptools</b> no longer ship.</p>
+	<p>Updating <b>{app}</b> on your bench group usually fixes this. If you can't update it, there are two other ways out.</p>
+	<p>Click <i>Help</i> for all three.</p>
+	"""
+
+	details["assistance_url"] = DOC_URLS[JobErr.PKG_RESOURCES]
+
+	return True
+
+
+def update_with_debug_your_app_message(details: Details, job: AgentJob, app: str) -> bool:
+	details[
+		"message"
+	] = f"""<p>The update of site <b>{job.site}</b> failed inside your app <b>{app}</b>, so it can't be fixed from our end.</p>
+	<p>Please go through the traceback, fix the app and deploy again.</p>
+	<p>Click <i>Help</i> for instructions on how to debug a bench.</p>
+	"""
+
+	details["assistance_url"] = DOC_URLS[JobErr.APP_DEBUG]
+
+	return True
+
+
+def update_with_check_for_update_message(details: Details, job: AgentJob, app: str) -> bool:
+	if not has_newer_release(job.bench, app):
+		return False
+
+	details["message"] = f"""<p>The update of site <b>{job.site}</b> failed inside the <b>{app}</b> app.</p>
+	<p>A newer release of <b>{app}</b> is available. Update it on your bench group and deploy — the fix may already be in.</p>
+	<p>Click <i>Help</i> for instructions on how to update a bench.</p>
+	"""
+
+	details["assistance_url"] = DOC_URLS[JobErr.APP_UPDATE]
+
+	return True
+
+
+def get_failing_app_and_source(job: AgentJob) -> tuple[str, str] | None:
+	"""Innermost app in the traceback that is installed on the bench, with its app source
+
+	Frappe is never the failing app. Every error passes through framework frames
+	(patch handler, database layer). So the innermost frame is frappe even when
+	another app raised the error. Frappe always has a newer release, so the banner
+	showed on every failed update."""
+	text = f"{job.traceback or ''}\n{job.output or ''}"
+	group = frappe.db.get_value("Bench", job.bench, "group")
+	if not group:
+		return None
+
+	for app in reversed(APP_FRAME.findall(text)):
+		if app == "frappe":
+			continue
+		source = frappe.db.get_value("Release Group App", {"parent": group, "app": app}, "source")
+		if source:
+			return app, source
+
+	return None
+
+
+def is_owned_by_site_team(source: str, job: AgentJob) -> bool:
+	"""Only the team that owns the app can fix it"""
+	return frappe.db.get_value("App Source", source, "team") == frappe.db.get_value("Site", job.site, "team")
 
 
 def get_default_title(job: AgentJob) -> str:
@@ -367,6 +530,10 @@ def get_default_message(job: AgentJob) -> str:
 	return f"<b>{job.job_type}</b> job failed on server <b>{job.server}</b>."
 
 
+# Customers cannot act on these failures. Each job type alerts the Frappe Cloud team instead
+JOBS_WITHOUT_FAILURE_NOTIFICATION = ("Purge Binlogs By Size Limit",)
+
+
 def send_job_failure_notification(job: AgentJob):
 	from press.press.doctype.site_migration.site_migration import (
 		get_ongoing_migration,
@@ -381,7 +548,7 @@ def send_job_failure_notification(job: AgentJob):
 	notification_type = get_notification_type(job)
 	team = None
 
-	if job.reference_doctype == "Site Database User":
+	if job.reference_doctype == "Site Database User" or job.job_type in JOBS_WITHOUT_FAILURE_NOTIFICATION:
 		return
 
 	if job.site:

@@ -1,6 +1,7 @@
 # Copyright (c) 2025, Frappe and contributors
 # For license information, please see license.txt
 
+import hmac
 
 import frappe
 import frappe.utils
@@ -8,8 +9,12 @@ from frappe import _
 from frappe.model.document import Document
 from frappe.query_builder import Criterion, JoinType
 from frappe.query_builder.functions import Count
+from frappe.utils.verified_command import get_signed_params
 
+from press.access.utils import is_outside_employee
 from press.utils import get_current_team
+
+PENDING_REQUEST_EXPIRY_DAYS = 7
 
 
 class SupportAccess(Document):
@@ -31,9 +36,10 @@ class SupportAccess(Document):
 		requested_by: DF.Link | None
 		requested_team: DF.Link | None
 		resources: DF.Table[SupportAccessResource]
+		server_ssh: DF.Check
 		site_domains: DF.Check
 		site_release_group: DF.Check
-		status: DF.Literal["Pending", "Accepted", "Rejected", "Forfeited", "Revoked"]
+		status: DF.Literal["Pending", "Accepted", "Rejected", "Forfeited", "Revoked", "Expired"]
 		target_team: DF.Link | None
 	# end: auto-generated types
 
@@ -50,6 +56,21 @@ class SupportAccess(Document):
 		"status",
 		"target_team",
 		"bench_ssh",
+		"server_ssh",
+	)
+
+	# What the target team answers a request with. `validate_status_change` and
+	# `validate_validity_change` decide whether this caller may.
+	dashboard_editable_fields = ("allowed_for", "status")
+
+	dashboard_insert_fields = (
+		"reason",
+		"resources",
+		"login_as_administrator",
+		"site_domains",
+		"site_release_group",
+		"bench_ssh",
+		"server_ssh",
 	)
 
 	def get_list_query(query, filters: dict | None, **args):
@@ -162,23 +183,31 @@ class SupportAccess(Document):
 		"""
 		Returns the possible target statuses for the current user.
 		"""
-		current_team = get_current_team()
-		if self.target_team == current_team:
+		# A guest answering from the email has no team
+		if self.flags.ignore_permissions:
+			return ["Pending", "Accepted", "Rejected", "Forfeited", "Revoked", "Expired"]
+		if self.acts_for_target_team:
 			return ["Accepted", "Rejected", "Revoked"]
-		if self.requested_team == current_team:
+		if self.requested_team == get_current_team():
 			return ["Pending", "Forfeited"]
 		return []
+
+	@property
+	def acts_for_target_team(self) -> bool:
+		"""A member, or a System Manager switched into the target team, answers for it. Other employees cannot."""
+		return self.target_team == get_current_team() and not is_outside_employee(self.target_team)
 
 	def is_valid_status_transition(self, status_from: str, status_to: str) -> bool:
 		"""
 		Checks if status can be changed from `status_from` to `status_to`.
 		"""
 		return status_to in {
-			"Pending": ["Accepted", "Rejected"],
+			"Pending": ["Accepted", "Rejected", "Expired"],
 			"Accepted": ["Revoked", "Forfeited"],
 			"Rejected": [],
 			"Forfeited": [],
 			"Revoked": [],
+			"Expired": [],
 		}.get(status_from, [])
 
 	def validate_status_change(self):
@@ -193,13 +222,17 @@ class SupportAccess(Document):
 		if not self.is_valid_status_transition(status_before, status_after):
 			frappe.throw(f"Cannot change status from {status_before} to {status_after}")
 		if status_after not in self.target_statuses:
-			frappe.throw("You are not allowed to set this status")
+			frappe.throw(
+				"You don't have permission to set this status on the support access request. Please ask a team admin to do this."
+			)
 
 	def validate_expiry(self):
 		if self.access_expired:
-			frappe.throw("Access expiry must be in the future")
+			frappe.throw("The access expiry must be in the future. Please pick a later date and time.")
 		if self.status == "Pending" and self.access_allowed_till:
-			frappe.throw("Pending requests cannot have access expiry")
+			frappe.throw(
+				"A pending request can't have an access expiry yet. Please approve the request first, then set when access should end."
+			)
 
 	def validate_target_team(self):
 		teams = set()
@@ -207,22 +240,65 @@ class SupportAccess(Document):
 			team = frappe.get_value(resource.document_type, resource.document_name, "team")
 			teams.add(team)
 		if len(teams) != 1:
-			frappe.throw("Resources must belong to the same team")
+			frappe.throw(
+				"All resources in a support access request must belong to the same team. Please create separate requests for each team's resources."
+			)
 		self.target_team = teams.pop()
 
 	def validate_validity_change(self):
-		is_target_team = get_current_team() == self.target_team
-		if self.has_value_changed("allowed_for") and not is_target_team:
+		if self.has_value_changed("allowed_for") and not self.acts_for_target_team:
 			message = _("You are not allowed to change the validity period.")
 			frappe.throw(message, frappe.ValidationError)
 		if self.status != "Pending":
 			message = _("Cannot change validity period of a processed request.")
 			frappe.throw(message, frappe.ValidationError)
 
+	def create_answer_url(self) -> str:
+		"""Return the link in the email, signed with the site secret for this request and its team."""
+		params = get_signed_params({"request": self.name, "team": self.target_team})
+		# A forged Host header must not send the link to another server
+		return frappe.utils.get_url(f"/access-request?{params}", allow_header_override=False)
+
+	@classmethod
+	def from_signed_params(cls, request, team, signature) -> "SupportAccess | None":
+		"""Return the request of a link from `create_answer_url`, if the link is unchanged."""
+		if not all(isinstance(value, str) for value in (request, team, signature)):
+			return None
+		expected = get_signed_params({"request": request, "team": team}).rpartition("&_signature=")[2]
+		if not hmac.compare_digest(signature, expected):
+			return None
+		if frappe.db.get_value("Support Access", request, "target_team") != team:
+			return None
+		return cls("Support Access", request)
+
+	def answer_from_email(self, status: str | None, allowed_for: str | None):
+		"""Answer for the target team. The signed link, sent only to the team owner, proves the caller may."""
+		self.validate_email_answer(status)
+		self.update({"status": status, "allowed_for": allowed_for or self.allowed_for})
+		self.save(ignore_permissions=True)
+
+	def validate_email_answer(self, status: str | None):
+		if self.status != "Pending":
+			frappe.throw(
+				_("This request is already {0}. It cannot be answered again.").format(self.status.lower())
+			)
+		if status not in ("Accepted", "Rejected"):
+			frappe.throw(_("Choose Accept or Reject to answer this access request."))
+		mailed_team = self.target_team
+		self.validate_target_team()
+		if self.target_team != mailed_team:
+			frappe.throw(
+				_("The resources in this request now belong to another team, so this link no longer works.")
+			)
+
 	def after_insert(self):
 		self.notify_on_request()
 
 	def on_update(self):
+		self.notify_on_status_change()
+
+	def expire(self):
+		self.db_set("status", "Expired")
 		self.notify_on_status_change()
 
 	def notify_on_status_change(self):
@@ -237,13 +313,16 @@ class SupportAccess(Document):
 			message = "Support access has been forfieted."
 			recipient = self.target_team
 
+		if self.status == "Expired":
+			message = "Your request for support access has expired without a response."
+
 		frappe.sendmail(
 			subject=title,
 			message=message,
 			recipients=recipient,
 			template="access_request_update",
 			args={
-				"status": self.status,
+				"message": message,
 				"resources": self.resources,
 			},
 		)
@@ -258,7 +337,7 @@ class SupportAccess(Document):
 				"title": title,
 				"message": message,
 			}
-		).insert()
+		).insert(ignore_permissions=True)  # A guest answers from the email
 
 		frappe.publish_realtime(
 			"press_notification",
@@ -281,6 +360,7 @@ class SupportAccess(Document):
 			args={
 				"reason": self.reason,
 				"resources": self.resources,
+				"answer_url": self.create_answer_url(),
 			},
 		)
 
@@ -303,6 +383,14 @@ class SupportAccess(Document):
 				"team": self.target_team,
 			},
 		)
+
+
+def expire_pending_requests():
+	"""Expire requests left pending for more than `PENDING_REQUEST_EXPIRY_DAYS` and notify the requester."""
+	cutoff = frappe.utils.add_to_date(frappe.utils.now_datetime(), days=-PENDING_REQUEST_EXPIRY_DAYS)
+	names = frappe.get_all("Support Access", {"status": "Pending", "creation": ("<", cutoff)}, pluck="name")
+	for name in names:
+		SupportAccess("Support Access", name).expire()
 
 
 def has_permission(doc, user=None, permission_type=None) -> bool:

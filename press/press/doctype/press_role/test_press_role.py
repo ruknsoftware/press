@@ -1,6 +1,9 @@
 # Copyright (c) 2024, Frappe and Contributors
 # See license.txt
 
+import json
+from unittest.mock import patch
+
 import frappe
 from frappe.model.naming import make_autoname
 from frappe.tests.utils import FrappeTestCase
@@ -45,6 +48,16 @@ class TestPressRole(FrappeTestCase):
 		self.assertTrue(perm_role_user_exists)
 		self.assertRaises(frappe.ValidationError, self.perm_role.add_user, self.team_member.name)
 
+	def test_adding_a_user_to_a_role_is_recorded_in_the_version_log(self):
+		# Frappe skips versions in tests
+		with patch.object(frappe, "in_test", False):
+			self.perm_role.add_user(self.team_member.name)
+		version = frappe.get_last_doc(
+			"Version", {"ref_doctype": "Press Role", "docname": self.perm_role.name}
+		)
+		added = json.loads(version.data)["added"]
+		self.assertIn(self.team_member.name, [row["user"] for table, row in added if table == "users"])
+
 	def test_remove_user(self):
 		self.perm_role.add_user(self.team_member.name)
 		self.perm_role.remove_user(self.team_member.name)
@@ -54,6 +67,70 @@ class TestPressRole(FrappeTestCase):
 		)
 		self.assertFalse(perm_role_user_exists)
 		self.assertRaises(frappe.ValidationError, self.perm_role.remove_user, self.team_member.name)
+
+	def test_delete_role_unsets_press_role_on_account_requests(self):
+		"""Invites keep the selected role in Account Request.press_role even
+		after acceptance. Deleting the role must unset those references,
+		otherwise the link check blocks the deletion forever."""
+		account_request = frappe.get_doc(
+			{
+				"doctype": "Account Request",
+				"team": self.team.name,
+				"email": "invitee@example.com",
+				"invited_by": self.team.user,
+				"press_role": self.perm_role.name,
+			}
+		).insert(ignore_permissions=True)
+
+		frappe.delete_doc("Press Role", self.perm_role.name)
+
+		self.assertFalse(frappe.db.exists("Press Role", self.perm_role.name))
+		self.assertFalse(frappe.db.get_value("Account Request", account_request.name, "press_role"))
+
+	def create_site_for(self, team):
+		subdomain = frappe.generate_hash(length=8)
+		site_name = f"{subdomain}.frappe.cloud"
+		create_test_site_record(site_name, subdomain, team)
+		self.addCleanup(lambda: frappe.db.delete("Site", {"name": site_name}))
+		return site_name
+
+	def test_add_resource_applies_on_top_of_a_concurrent_edit(self):
+		"""Two role edits in flight at once used to make the later one fail
+		with TimestampMismatchError, because it saved a row that had been
+		committed since it was read."""
+		site_name = self.create_site_for(self.team.name)
+		role = frappe.get_doc("Press Role", self.perm_role.name)
+		# Stands in for another request committing an edit to the same role.
+		frappe.db.set_value("Press Role", self.perm_role.name, "title", role.title)
+
+		role.add_resource([{"document_type": "Site", "document_name": site_name}])
+
+		self.perm_role.reload()
+		self.assertTrue(any(r.document_name == site_name for r in self.perm_role.resources))
+
+	def test_rename_keeps_the_role_and_rejects_a_title_another_role_already_has(self):
+		"""Roles created for a member's own resource get a generated title.
+		The team owner renames them, which must not trip the duplicate check
+		on the role's own title."""
+		self.perm_role.title = "Support"
+		self.perm_role.save()
+		self.assertEqual(frappe.db.get_value("Press Role", self.perm_role.name, "title"), "Support")
+
+		self.perm_role2.title = "Support"
+		with self.assertRaises(frappe.DuplicateEntryError) as context:
+			self.perm_role2.save()
+		self.assertIn("Support", str(context.exception))
+
+	def test_add_resource_rejects_cross_team_document(self):
+		other_team = create_test_team()
+		self.addCleanup(frappe.delete_doc, "Team", other_team.name, force=True)
+		site_name = self.create_site_for(other_team.name)
+
+		with self.assertRaises(frappe.ValidationError):
+			self.perm_role.add_resource([{"document_type": "Site", "document_name": site_name}])
+
+		self.perm_role.reload()
+		self.assertFalse(any(r.document_name == site_name for r in self.perm_role.resources))
 
 
 # utils
@@ -79,3 +156,11 @@ def create_user(email):
 
 def get_users(role):
 	return role.users
+
+
+def create_test_site_record(name, subdomain, team_name):
+	"""Insert a bare Site row without running any hooks. For use in tests only."""
+	Site = frappe.qb.DocType("Site")
+	frappe.qb.into(Site).columns(
+		"name", "team", "subdomain", "status", "server", "bench", "cluster", "group"
+	).insert(name, team_name, subdomain, "Active", "test-server", "test-bench", "Default", "test-group").run()

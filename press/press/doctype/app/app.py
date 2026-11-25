@@ -1,23 +1,38 @@
 # Copyright (c) 2019, Frappe and contributors
 # For license information, please see license.txt
 
+from __future__ import annotations
 
 import typing
-from collections.abc import Iterator
 
 import frappe
 import rq
 import semantic_version as sv
 from frappe.model.document import Document
-from semantic_version.base import AllOf, AnyOf
 
 from press.utils.jobs import has_job_timeout_exceeded
 
 if typing.TYPE_CHECKING:
+	from collections.abc import Iterator
+
+	from semantic_version.base import AllOf, AnyOf
+
+	from press.press.doctype.app_release.app_release import AppRelease
 	from press.press.doctype.app_source.app_source import AppSource
 
 
+VERSIONING_DOCS = (
+	"See <a href='https://docs.frappe.io/cloud/custom-apps/app-versioning/versioning'>"
+	"declaring app versions</a> for how to set this up in pyproject.toml."
+)
+
+
 class VersioningError(Exception): ...
+
+
+class AppPolicyResult(typing.TypedDict):
+	app: str
+	source: str
 
 
 class App(Document):
@@ -68,12 +83,25 @@ class App(Document):
 			source: AppSource = frappe.get_doc("App Source", existing_source[0].name)
 			versions = set(version.version for version in source.versions)
 			new_versions = supported_frappe_versions - versions
-			for new_version in new_versions:
-				source.add_version(new_version)
+			# The hacks below are to ensure that we don't call save on the `App Source` document
+			# Triggering validations and other logic might fail app addition
+			# This is temporary until we merge all app sources!
+			for idx, new_version in enumerate(new_versions, start=0):
+				frappe.get_doc(
+					{
+						"doctype": "App Source Version",
+						"parenttype": "App Source",
+						"parentfield": "versions",
+						"parent": source.name,
+						"version": new_version,
+						"idx": len(source.versions) + idx + 1,
+					}
+				).insert()
 
 			if github_installation_id and source.github_installation_id != github_installation_id:
-				source.github_installation_id = github_installation_id
-				source.save()
+				frappe.db.set_value(
+					"App Source", source.name, "github_installation_id", github_installation_id
+				)
 		else:
 			# Add new App Source
 			if not supported_frappe_versions:
@@ -164,14 +192,20 @@ def get_lower_bound_major(spec: sv.NpmSpec) -> int | None:
 		if getattr(c, "operator", None) in ("<", "<=") and getattr(c, "target", None) is not None
 	]
 
-	# Ensure that there is no overlap or inconsistency between upper and lower bounds
+	# Ensure that there is no overlap or inconsistency between upper and lower bounds.
+	# A prerelease bound also lands a companion clause on the opposite side here —
+	# `<=17.0.0-dev` yields `>=17.0.0`, `>=16.0.0-dev` yields `<16.0.1` — which is why a
+	# range that reads fine can still trip this. See NpmSpec.parse in semantic_version/base.py
+	# and https://github.com/npm/node-semver#prerelease-tags for the rule it implements.
+	lowest = min(lowers)
 	if any(upper.major < lower.major for upper in uppers for lower in lowers):
 		frappe.throw(
-			"Invalid version range: There is an inconsistency between the upper and lower bound major versions. "
-			"Please ensure the version range specifies valid major versions."
+			f"Invalid version range '{spec}': the upper bound's major version is below the lower bound's. "
+			"A prerelease upper bound does this on its own — '<=X.0.0-dev' also implies '>=X.0.0'. "
+			f"Use a stable upper bound, e.g. '>={lowest} <{lowest.major + 1}.0.0'. {VERSIONING_DOCS}"
 		)
 
-	return min(lowers).major
+	return lowest.major
 
 
 def map_frappe_version(
@@ -185,16 +219,17 @@ def map_frappe_version(
 	try:
 		version_string = version_string.replace(" ", "").replace(",", " ")
 		spec = sv.NpmSpec(version_string)
-	except ValueError:
+	except (AttributeError, TypeError, ValueError):
 		frappe.throw(
-			f"Invalid version format for app '{app_title}'. Please use NPM-style semver ranges (e.g. '>=15.0.0 <16.0.0')."
+			f"Invalid version format for app '{app_title}'. Please use NPM-style semver ranges "
+			f"(e.g. '>=15.0.0 <16.0.0'). {VERSIONING_DOCS}"
 		)
 
 	if not is_bounded(spec):
 		frappe.throw(
 			f"Version range must be bounded for app '{app_title}'. "
 			"Please provide both a lower and an upper bound "
-			"(e.g. '>=15.0.0 <16.0.0')."
+			f"(e.g. '>=15.0.0 <16.0.0'). {VERSIONING_DOCS}"
 		)
 
 	highest_supported_stable_version = sv.Version(
@@ -249,3 +284,89 @@ def parse_frappe_version(
 		return set([version_string] if isinstance(version_string, str) else version_string)
 
 	return set(map_frappe_version(version_string, frappe_versions, app_title, ease_versioning_constrains))
+
+
+def get_app_source_from_supported_versions(
+	app: str, supported_versions: set[str], filters: dict[str, str] | None = None
+) -> AppSource | None:
+	"""From the provided versions, fetch the app source that supports the highest version."""
+	version_numbers = frappe.get_all(
+		"Frappe Version", {"name": ("in", supported_versions)}, ["name", "number"]
+	)
+	if not version_numbers:
+		return None
+
+	version_numbers = sorted(version_numbers, key=lambda x: x["number"], reverse=True)
+
+	app_source = frappe.qb.DocType("App Source")
+	app_source_version = frappe.qb.DocType("App Source Version")
+
+	base_query = (
+		frappe.qb.from_(app_source)
+		.join(app_source_version)
+		.on(app_source.name == app_source_version.parent)
+		.where(app_source.app == app)
+		.select(app_source.name)
+		.groupby(app_source.name)
+		.limit(1)
+	)
+
+	for field, value in (filters or {}).items():
+		base_query = base_query.where(app_source[field] == value)
+
+	for version in version_numbers:
+		if app_source_name := base_query.where(app_source_version.version == version["name"]).run(pluck=True):
+			return frappe.get_doc("App Source", app_source_name[0])
+
+	return None
+
+
+def get_latest_release_of_app_from_source(app_source: AppSource) -> AppRelease | None:
+	app_release_info = frappe.db.get_value(
+		"App Release",
+		{"app": app_source.app, "source": app_source.name},
+		["name", "hash"],
+		order_by="creation",
+	)
+
+	if not app_release_info:
+		return None
+
+	return frappe.get_doc("App Release", app_release_info[0])
+
+
+def get_app_from_policies(
+	scope: typing.Literal["Frappe Version", "Source", "App Release"],
+	target: str,
+	for_creation: bool = False,
+	for_installation: bool = False,
+	for_updates: bool = False,
+) -> list[AppPolicyResult]:
+	"""Get all apps based on the policy results for a given version string"""
+	ReleaseGroupPolicy = frappe.qb.DocType("Release Group Policy")
+	ReleaseGroupPolicyApp = frappe.qb.DocType("Release Group Policy App")
+
+	policy_result = (
+		frappe.qb.from_(ReleaseGroupPolicy)
+		.join(ReleaseGroupPolicyApp)
+		.on(ReleaseGroupPolicyApp.parent == ReleaseGroupPolicy.name)
+		.where(ReleaseGroupPolicy.scope == scope)
+		.where(ReleaseGroupPolicy.target == target)
+		.where(ReleaseGroupPolicy.status == "Active")
+		.select(ReleaseGroupPolicyApp.app, ReleaseGroupPolicyApp.source)
+	)
+
+	if for_creation:
+		policy_result = policy_result.where(
+			ReleaseGroupPolicyApp.add_on_creation == 1,
+		)
+
+	if for_installation:
+		policy_result = policy_result.where(
+			ReleaseGroupPolicyApp.install_on_site_creation == 1,
+		)
+
+	if for_updates:
+		policy_result = policy_result.where(ReleaseGroupPolicyApp.for_updates == 1)
+
+	return policy_result.run(as_dict=True)

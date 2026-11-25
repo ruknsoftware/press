@@ -4,7 +4,7 @@
 
 <script>
 import PlansCards from './PlansCards.vue';
-import { getPlans } from '../data/plans';
+import { getPlans, planSupportsProvider } from '../data/plans';
 
 export default {
 	name: 'SitePlansCards',
@@ -12,6 +12,8 @@ export default {
 		'modelValue',
 		'isPrivateBenchSite',
 		'isDedicatedServerSite',
+		'serverPlanPrice',
+		'serverSupportQuotaAvailable',
 		'selectedCluster',
 		'selectedApps',
 		'selectedVersion',
@@ -38,7 +40,12 @@ export default {
 				plans = plans.filter((plan) => plan.private_benches);
 			}
 			if (this.isDedicatedServerSite) {
-				plans = plans.filter((plan) => plan.dedicated_server_plan);
+				plans = plans.filter(
+					(plan) =>
+						plan.dedicated_server_plan &&
+						(!plan.restrict_based_on_dedicated_server_plan ||
+							this.serverPlanPrice >= plan.minimum_server_price_usd),
+				);
 			} else {
 				plans = plans.filter((plan) => !plan.dedicated_server_plan);
 			}
@@ -84,18 +91,12 @@ export default {
 				plans = plans.filter((plan) => !plan.restricted_plan);
 			}
 			if (this.selectedProvider) {
-				const provider = ['Generic', 'Scaleway'].includes(this.selectedProvider)
-					? 'AWS EC2'
-					: this.selectedProvider;
-
 				plans = plans.map((plan) => {
 					return {
 						...plan,
 						disabled:
 							plan.disabled ||
-							(plan.cloud_providers && plan.cloud_providers.length > 0
-								? !plan.cloud_providers.includes(provider)
-								: false),
+							!planSupportsProvider(plan, this.selectedProvider),
 					};
 				});
 			}
@@ -105,6 +106,7 @@ export default {
 			return plans.map((plan) => {
 				return {
 					...plan,
+					sublabel: plan.plan_description || null,
 					features: [
 						{
 							label: `${this.$format.plural(
@@ -140,11 +142,49 @@ export default {
 							value: plan.offsite_backups ? 'Offsite Backups' : '',
 						},
 						{
+							value: plan.private_benches ? 'Private Bench' : '',
+						},
+						{
 							value: plan.monitor_access ? 'Advanced Monitoring' : '',
 						},
 					].filter((feature) => feature.condition ?? true),
 				};
 			});
+		},
+	},
+	watch: {
+		plans: {
+			immediate: true,
+			handler: function (plans) {
+				if (!this.isDedicatedServerSite) return;
+
+				if (!plans.length) return;
+
+				const bestPlan = this.getBestDedicatedSitePlan();
+
+				if (bestPlan) {
+					this.currentPlan = bestPlan;
+				}
+			},
+		},
+	},
+	methods: {
+		// Currently best plan is determined based on warranty and CPU time only (may change later)
+		getBestDedicatedSitePlan() {
+			let filteredPlans = this.plans;
+
+			if (this.serverSupportQuotaAvailable) {
+				filteredPlans = filteredPlans.filter((plan) => plan.support_included);
+			}
+
+			const bestPlan = filteredPlans.reduce((best, curr) => {
+				return parseFloat(curr.cpu_time_per_day) >
+					parseFloat(best.cpu_time_per_day)
+					? curr
+					: best;
+			});
+
+			return bestPlan;
 		},
 	},
 };

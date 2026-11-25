@@ -22,6 +22,7 @@ from tenacity import RetryError, retry, stop_after_attempt, wait_fixed
 from tenacity.retry import retry_if_not_result
 from twilio.base.exceptions import TwilioRestException
 
+from press.access.staff_roles import safe_for_readers
 from press.api.server import prometheus_query
 from press.press.doctype.agent_job.agent_job import AgentJob
 from press.press.doctype.bench.bench import Bench
@@ -30,6 +31,7 @@ from press.press.doctype.database_server.database_server import DatabaseServer
 from press.press.doctype.server.server import MARIADB_DATA_MNT_POINT
 from press.press.doctype.telegram_message.telegram_message import TelegramMessage
 from press.utils import log_error
+from press.utils.raven import send_raven_message
 
 if TYPE_CHECKING:
 	from frappe.types import DF
@@ -62,6 +64,7 @@ MIN_FIRING_INSTANCES_FRACTION = (
 )
 
 DAY_HOURS = range(9, 18)
+MAX_ASSIGNED_CALLS_BEFORE_DEFAULT_AT_NIGHT = 10
 CONFIRMATION_THRESHOLD_SECONDS_DAY = 5 * 60  # 5 minutes;time after which humans are called
 CONFIRMATION_THRESHOLD_SECONDS_NIGHT = (
 	10 * 60  # 10 minutes; time after which humans are called
@@ -98,6 +101,8 @@ class Incident(WebsiteGenerator):
 		confirmed_at: DF.Datetime | None
 		corrective_suggestions: DF.Table[IncidentSuggestion]
 		description: DF.TextEditor | None
+		ignore_reason: DF.SmallText | None
+		ignored: DF.Check
 		investigation: DF.Link | None
 		likely_cause: DF.Text | None
 		phone_call: DF.Check
@@ -162,9 +167,12 @@ class Incident(WebsiteGenerator):
 			current_datetime = frappe.utils.now_datetime()
 			self.send_email_notification()
 			if self.status == "Resolved" or self.status == "Auto-Resolved":
+				if self.confirmed_at and not self.resolved_at:  # reopened incidents resolve only once
+					self.create_log_for_server(is_resolved=True)
 				self.db_set("resolved_at", current_datetime)
 			elif self.status == "Confirmed" and not self.confirmed_at:
 				self.db_set("confirmed_at", current_datetime)
+				self.create_log_for_server()
 				if not self.called_customer:
 					self.call_customers()
 
@@ -410,7 +418,9 @@ class Incident(WebsiteGenerator):
 	def monitor_server(self) -> MonitorServer:
 		press_settings: PressSettings = frappe.get_cached_doc("Press Settings")
 		if not (monitor_url := press_settings.monitor_server):
-			frappe.throw("Monitor Server not set in Press Settings")
+			frappe.throw(
+				"Monitor Server is not set. Please configure the Monitor Server in Press Settings before continuing."
+			)
 		return frappe.get_cached_doc("Monitor Server", monitor_url)
 
 	def get_grafana_auth_header(self):
@@ -437,7 +447,9 @@ class Incident(WebsiteGenerator):
 	def reboot_database_server(self):
 		db_server_name = frappe.db.get_value("Server", self.server, "database_server")
 		if not db_server_name:
-			frappe.throw("No database server found for this server")
+			frappe.throw(
+				"No database server is linked to this server. Please ensure the server has an associated database server."
+			)
 		db_server = DatabaseServer("Database Server", db_server_name)
 		try:
 			db_server.reboot_with_serial_console()
@@ -445,6 +457,46 @@ class Incident(WebsiteGenerator):
 			db_server.reboot()
 		self.add_likely_cause("Rebooted database server.")
 		self.save()
+
+	@frappe.whitelist()
+	def ignore(self, reason: str):
+		"""Stop calling the team for this incident; customers see and hear about it as usual"""
+		self.check_permission("write")
+		if not (reason := reason.strip()):
+			frappe.throw("Please give a reason for ignoring this incident.")
+		self.ignored = True
+		self.ignore_reason = reason
+		self.save()
+		self.add_comment("Comment", f"Ignored incident: {reason}")
+
+	@frappe.whitelist()
+	def stop_ignoring(self, reason: str):
+		"""Resume calling the team for this incident"""
+		self.check_permission("write")
+		if not (reason := reason.strip()):
+			frappe.throw("Please give a reason for no longer ignoring this incident.")
+		if not self.ignored:
+			frappe.throw("This incident is not being ignored. Reload the page to see its current state.")
+		# Repeat calls are timed from modified, which save() resets, so check before saving
+		call_due = self.time_to_call_for_help or self.time_to_call_for_help_again
+		self.ignored = False
+		self.ignore_reason = None
+		self.save()
+		self.add_comment("Comment", f"Stopped ignoring incident: {reason}")
+		if call_due and self.waited_enough_for_investigator_reactions:
+			self.call_humans()
+
+	@frappe.whitelist()
+	def send_custom_email(self, subject: str, message: str):
+		"""Email a hand-written update to the server's incident contacts"""
+		self.check_permission("write")
+		if not get_communication_info("Email", "Server Activity", "Server", self.server):
+			frappe.throw(
+				"No one is set up to receive emails for this server. "
+				"Add a Server Activity email to the server's or its team's communication info."
+			)
+		self.send_mail(subject, message, raise_exception=True)
+		self.add_comment("Comment", f"Sent email <b>{frappe.utils.escape_html(subject)}</b><br>{message}")
 
 	@frappe.whitelist()
 	def cancel_stuck_jobs(self):
@@ -485,7 +537,7 @@ class Incident(WebsiteGenerator):
 		"""
 		down_benches = self.monitor_server.get_benches_down_for_server(str(self.server))
 		if not down_benches:
-			frappe.throw("No down benches found for this server")
+			frappe.throw("No down benches were found for this server. There may be nothing to act on.")
 			return
 		for bench_name in down_benches:
 			bench: Bench = Bench("Bench", bench_name)
@@ -506,6 +558,40 @@ class Incident(WebsiteGenerator):
 			deduplicate=True,
 		)
 
+	def get_night_shift_humans(
+		self,
+		incident_settings: "IncidentSettings",
+	) -> "list[IncidentSettingsUser | IncidentSettingsSelfHostedUser] | None":
+		"""Returns night shift users for today mapped to their IncidentSettingsUser records, or None if no shift defined."""
+		today = frappe.utils.now_datetime().strftime("%A")
+		today_users = [row.user for row in incident_settings.night_shifts if row.day == today]
+		if not today_users:
+			return None
+
+		# self_hosted_users entries overwrite users entries when the same person appears in both tables
+		phone_by_user: dict[str, "IncidentSettingsUser | IncidentSettingsSelfHostedUser"] = {
+			row.user: row for row in incident_settings.users
+		}
+		phone_by_user.update({row.user: row for row in incident_settings.self_hosted_users})
+
+		matched = [phone_by_user[u] for u in today_users if u in phone_by_user]
+		return matched or None
+
+	def _round_robin_order(self, users: list) -> list:
+		"""Rotate list so the user after acknowledged_by comes first."""
+		for i, user in enumerate(users):
+			if user.user == self.acknowledged_by:
+				return users[i + 1 :] + users[: i + 1]
+		return users
+
+	def _priority_order(self, users: list) -> list:
+		"""Put acknowledged_by first."""
+		for user in users:
+			if user.user == self.acknowledged_by:
+				users = [user] + [u for u in users if u != user]
+				break
+		return users
+
 	def get_humans(
 		self,
 	):
@@ -513,18 +599,30 @@ class Incident(WebsiteGenerator):
 		Returns a list of users who are in the incident team
 		"""
 		incident_settings: IncidentSettings = frappe.get_cached_doc("Incident Settings")  # type: ignore
-		users = incident_settings.users
+		is_night = frappe.utils.now_datetime().hour not in DAY_HOURS
+
+		call_count = len(self.updates)
+		max_assigned_calls = (
+			incident_settings.night_shift_call_limit or MAX_ASSIGNED_CALLS_BEFORE_DEFAULT_AT_NIGHT
+		)
+		if (
+			is_night
+			and call_count < max_assigned_calls
+			and (night_users := self.get_night_shift_humans(incident_settings))
+		):
+			if self.status == "Acknowledged":
+				return self._round_robin_order(night_users)
+			return night_users
+
+		users = list(incident_settings.users)
 		if frappe.db.exists("Self Hosted Server", {"server": self.server}) or frappe.db.get_value(
 			"Server", self.server, "is_self_hosted"
 		):
-			users = incident_settings.self_hosted_users
-		ret: DF.Table = users
-		if self.status == "Acknowledged":  # repeat the acknowledged user to be the first
-			for user in users:
-				if user.user == self.acknowledged_by:
-					ret.remove(user)
-					ret.insert(0, user)
-		return ret
+			users = list(incident_settings.self_hosted_users)
+
+		if self.status == "Acknowledged":
+			return self._priority_order(users)
+		return users
 
 	@property
 	def twilio_phone_number(self):
@@ -553,11 +651,10 @@ class Incident(WebsiteGenerator):
 		return call.fetch().status  # will eventually be no-answer
 
 	def notify_unable_to_reach_twilio(self):
-		TelegramMessage.enqueue(
-			f"""Unable to reach Twilio for Incident in {self.server}
-
-Likely due to insufficient balance or incorrect credentials""",
-			reraise=True,
+		send_raven_message(
+			f"⚠️ **Unable to reach Twilio** for Incident in {self.server}. "
+			"Likely due to insufficient balance or incorrect credentials.",
+			frappe.db.get_single_value("Press Settings", "raven_incidents_channel"),
 		)
 
 	def call_human(self, human: IncidentSettingsUser | IncidentSettingsSelfHostedUser):
@@ -567,34 +664,43 @@ Likely due to insufficient balance or incorrect credentials""",
 				to=human.phone,
 				from_=self.twilio_phone_number,
 			)
-		except TwilioRestException:
-			self.notify_unable_to_reach_twilio()
-			raise
+		except TwilioRestException as e:
+			error = e
+		# Outside the except, so a Raven error log does not carry the Twilio traceback
+		self.notify_unable_to_reach_twilio()
+		raise error
+
+	def _attempt_call_human(self, human) -> bool:
+		"""Returns True if call was picked up (stop calling), False to continue to next human."""
+		call = self.call_human(human)
+		acknowledged = False
+		status = str(call.status)
+		try:
+			status = str(self.wait_for_pickup(call))
+		except RetryError:
+			status = "timeout"  # not Twilio's status; mostly translates to no-answer
+		else:
+			if status in ["in-progress", "completed"]:  # call was picked up
+				acknowledged = True
+				self.status = "Acknowledged"
+				self.acknowledged_by = human.user
+		finally:
+			self.add_acknowledgment_update(human, acknowledged=acknowledged, call_status=status)
+		return acknowledged
 
 	def _call_humans(self):
-		if not self.phone_call or not self.global_phone_call_enabled:
+		if self.ignored or not self.phone_call or not self.global_phone_call_enabled:
 			return
 		if (
 			ignore_till := frappe.db.get_value("Server", self.server, "ignore_incidents_till")
 		) and ignore_till > frappe.utils.now_datetime():
 			return
+		if not self.monitor_server.get_sites_down_for_server(str(self.server)):
+			self.resolve()
+			return
 		for human in self.get_humans():
-			if not (call := self.call_human(human)):
-				return  # can't twilio
-			acknowledged = False
-			status = str(call.status)
-			try:
-				status = str(self.wait_for_pickup(call))
-			except RetryError:
-				status = "timeout"  # not Twilio's status; mostly translates to no-answer
-			else:
-				if status in ["in-progress", "completed"]:  # call was picked up
-					acknowledged = True
-					self.status = "Acknowledged"
-					self.acknowledged_by = human.user
-					break
-			finally:
-				self.add_acknowledgment_update(human, acknowledged=acknowledged, call_status=status)
+			if self._attempt_call_human(human):
+				break
 
 	def send_sms_via_twilio(self):
 		"""
@@ -631,7 +737,7 @@ Likely due to insufficient balance or incorrect credentials""",
 		"""
 		self.send_mail(subject, message)
 
-	def send_mail(self, subject: str, message: str):
+	def send_mail(self, subject: str, message: str, raise_exception: bool = False):
 		try:
 			frappe.sendmail(
 				recipients=get_communication_info("Email", "Server Activity", "Server", self.server),
@@ -647,6 +753,8 @@ Likely due to insufficient balance or incorrect credentials""",
 			)
 
 		except Exception:
+			if raise_exception:
+				raise
 			# Swallow the exception to avoid breaking the Incident creation
 			log_error("Incident Notification Email Failed")
 
@@ -665,6 +773,8 @@ Likely due to insufficient balance or incorrect credentials""",
 		message = self.get_email_message()
 		self.send_mail(subject, message)
 
+	@frappe.whitelist()
+	@safe_for_readers
 	def get_email_subject(self):
 		title = str(frappe.db.get_value("Server", self.server, "title"))
 		name = title.removesuffix(" - Application") or self.server
@@ -728,6 +838,8 @@ Likely due to insufficient balance or incorrect credentials""",
 			return
 
 		server_title_encoded = urllib.parse.quote(server_title)
+
+		# TODO Better message for Disk Full incidents
 
 		press_public_base_url = frappe.utils.get_url()
 		twilio_client.calls.create(
@@ -793,7 +905,6 @@ Likely due to insufficient balance or incorrect credentials""",
 			return
 		else:
 			if not last_resolved.is_enough_firing:
-				self.create_log_for_server(is_resolved=True)
 				self.resolve()
 
 	def resolve(self):
@@ -822,7 +933,13 @@ Likely due to insufficient balance or incorrect credentials""",
 	@property
 	def waited_enough_for_investigator_reactions(self) -> bool:
 		"""Check if the investigator has taken any action"""
-		investigator: IncidentInvestigator = frappe.get_doc("Incident Investigator", {"incident": self.name})
+		investigation = self.investigation or frappe.db.get_value(
+			"Incident Investigator", {"incident": self.name}, "name"
+		)
+		if not investigation:
+			return True
+
+		investigator: IncidentInvestigator = frappe.get_doc("Incident Investigator", investigation)
 		wait_time = get_wait_time_post_investigator_actions()
 		if investigator.status != "Completed":
 			return False
@@ -831,7 +948,7 @@ Likely due to insufficient balance or incorrect credentials""",
 		if (
 			investigator.status == "Completed"
 			and investigator.action_steps
-			and (investigator.modified > frappe.utils.now_datetime() - timedelta(minutes=wait_time))
+			and (investigator.modified > frappe.utils.now_datetime() - timedelta(seconds=wait_time))
 		):
 			return False
 
@@ -839,13 +956,15 @@ Likely due to insufficient balance or incorrect credentials""",
 
 	@property
 	def time_to_call_for_help(self) -> bool:
-		return self.status == "Confirmed" and frappe.utils.now_datetime() - self.creation > timedelta(
+		creation = frappe.utils.get_datetime(self.creation)  # a str when the doc comes from the Desk form
+		return self.status == "Confirmed" and frappe.utils.now_datetime() - creation > timedelta(
 			seconds=get_confirmation_threshold_duration() + get_call_threshold_duration()
 		)
 
 	@property
 	def time_to_call_for_help_again(self) -> bool:
-		return self.status == "Acknowledged" and frappe.utils.now_datetime() - self.modified > timedelta(
+		modified = frappe.utils.get_datetime(self.modified)  # a str when the doc comes from the Desk form
+		return self.status == "Acknowledged" and frappe.utils.now_datetime() - modified > timedelta(
 			seconds=get_call_repeat_interval()
 		)
 
@@ -854,6 +973,7 @@ Likely due to insufficient balance or incorrect credentials""",
 		return self.monitor_server.get_sites_down_for_server(str(self.server))
 
 	@frappe.whitelist()
+	@safe_for_readers
 	def get_down_site(self):
 		return self.sites_down[0] if self.sites_down else None
 
@@ -923,13 +1043,18 @@ def resolve_incidents():
 		pluck="name",
 	)
 	for incident_name in ongoing_incidents:
-		incident = Incident("Incident", incident_name)
-		incident.check_resolved()
-		if (
-			incident.time_to_call_for_help or incident.time_to_call_for_help_again
-		) and incident.waited_enough_for_investigator_reactions:
-			incident.create_log_for_server()
-			incident.call_humans()
+		try:
+			incident = Incident("Incident", incident_name)
+			incident.check_resolved()
+			if incident.ignored:
+				continue
+			if (
+				incident.time_to_call_for_help or incident.time_to_call_for_help_again
+			) and incident.waited_enough_for_investigator_reactions:
+				incident.call_humans()
+				frappe.db.commit()
+		except Exception:
+			log_error(f"Error while resolving incident {incident_name}")
 
 
 def notify_ignored_servers():

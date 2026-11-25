@@ -6,10 +6,14 @@
   gather_facts: yes
   roles:
     - role: essentials
+    - role: block_sctp
     - role: user
     - role: nginx
     - role: agent
     - role: proxy
     - role: node_exporter
+    - role: user_ssh_certificate
     - role: filebeat
+    - role: auditd
     - role: clamav
+    - role: fail2ban

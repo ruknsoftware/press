@@ -12,6 +12,7 @@ from frappe.core.utils import find
 from frappe.model.document import Document
 
 from press.agent import Agent
+from press.press.doctype.press_job.press_job import get_job_class
 
 if TYPE_CHECKING:
 	from press.press.doctype.server.server import Server
@@ -44,6 +45,7 @@ class PrometheusAlertRule(Document):
 		press_job_type: DF.Link | None
 		repeat_interval: DF.Data
 		route_preview: DF.Code | None
+		send_to_raven: DF.Check
 		severity: DF.Literal["Critical", "Warning", "Information"]
 		silent: DF.Check
 	# end: auto-generated types
@@ -52,7 +54,7 @@ class PrometheusAlertRule(Document):
 		self.alert_preview = yaml.dump(self.get_rule())
 		self.route_preview = yaml.dump(self.get_route())
 		if self.enabled and not self.expression:
-			frappe.throw("Enabled alert rules require an expression")
+			frappe.throw("Please add an expression for this alert rule before enabling it.")
 
 	def get_rule(self):
 		labels = json.loads(self.labels)
@@ -123,7 +125,7 @@ class PrometheusAlertRule(Document):
 		return routes_dict
 
 	def react(self, instance_type: str, instance: str, labels: dict | None = None):
-		return self.run_press_job(self.press_job_type, instance_type, instance, labels)
+		return self.run_press_job(self.press_job_type, instance_type, instance, labels)  # type: ignore[arg-type]
 
 	def run_press_job(
 		self, job_name: str, server_type: str, server_name: str, labels: dict | None = None, arguments=None
@@ -141,6 +143,9 @@ class PrometheusAlertRule(Document):
 			labels = {}
 
 		arguments.update({"labels": labels})
+
+		if not get_job_class(job_name).should_react_to_alert(server, labels):
+			return None
 
 		if existing_jobs := frappe.get_all(
 			"Press Job",
@@ -162,4 +167,4 @@ class PrometheusAlertRule(Document):
 				"virtual_machine": server.virtual_machine,
 				"arguments": json.dumps(arguments, indent=2, sort_keys=True),
 			}
-		).insert()
+		).insert(ignore_permissions=True)
