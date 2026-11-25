@@ -5,13 +5,14 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import frappe
 from frappe.model.document import Document
 from frappe.query_builder import Interval
 from frappe.query_builder.functions import Now
 
+from press.press.doctype.github_installation.github_installation import disable_installations_for_account
 from press.utils import log_error
 
 if TYPE_CHECKING:
@@ -42,7 +43,9 @@ class GitHubWebhookLog(Document):
 		secret = frappe.db.get_single_value("Press Settings", "github_webhook_secret")
 		digest = hmac.HMAC(secret.encode(), self.payload.encode(), hashlib.sha1)
 		if not hmac.compare_digest(digest.hexdigest(), self.signature):
-			frappe.throw("Invalid Signature")
+			frappe.throw(
+				"The webhook signature is invalid. Please verify the configured GitHub webhook secret matches."
+			)
 
 		payload = self.get_parsed_payload()
 		self.github_installation_id = payload.get("installation", {}).get("id")
@@ -110,6 +113,7 @@ class GitHubWebhookLog(Document):
 
 	def handle_installation_deletion(self, payload):
 		owner = payload["installation"]["account"]["login"]
+		disable_installations_for_account(payload["installation"])
 		repositories = payload.get("repositories", [])
 
 		for repo in repositories:

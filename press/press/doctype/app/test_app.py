@@ -99,6 +99,7 @@ class TestApp(FrappeTestCase):
 		)
 
 		self.assertEqual(source_1.name, source_2.name)
+		source_2 = source_2.reload()
 		self.assertEqual(len(source_2.versions), 2)
 		self.assertEqual(source_2.versions[0].version, "Version 12")
 		self.assertEqual(source_2.versions[1].version, "Version 13")
@@ -146,7 +147,7 @@ class TestApp(FrappeTestCase):
 
 		accepted_custom_version_strings = [
 			(">=16.0.0,<17.0.0", {"Version 16", "Nightly"}),
-			(">=15.0.0,<16.0.0", {"Version 15", "Nightly"}),  # Nightly's version number is 15 for some reason
+			(">=15.0.0,<16.0.0", {"Version 15"}),
 			(">=14.0.0,<15.0.0", {"Version 14"}),
 			(">=13.0.0,<14.0.0", {"Version 13"}),
 		]
@@ -166,18 +167,39 @@ class TestApp(FrappeTestCase):
 			with self.assertRaises(frappe.ValidationError):
 				parse_frappe_version(invalid_custom_version_string, app_title="test-app")
 
+	def test_version_parsing_rejects_a_missing_version_string_with_a_readable_error(self):
+		"""Regression: a None version string used to raise AttributeError from str.replace."""
+		with self.assertRaises(frappe.ValidationError) as context:
+			parse_frappe_version(None, app_title="test-app")
+
+		self.assertIn("Invalid version format for app 'test-app'", str(context.exception))
+
+	def test_prerelease_upper_bound_is_rejected_with_a_message_naming_the_range(self):
+		with self.assertRaises(frappe.ValidationError) as context:
+			parse_frappe_version(
+				">=16.0.0-dev,<=17.0.0-dev", app_title="test-app", ease_versioning_constrains=True
+			)
+
+		self.assertIn(">=16.0.0-dev <=17.0.0-dev", str(context.exception))
+		self.assertIn(">=16.0.0-dev <17.0.0", str(context.exception))
+
+	def test_suggested_upper_bound_follows_the_range_that_was_rejected(self):
+		with self.assertRaises(frappe.ValidationError) as context:
+			parse_frappe_version(
+				">=14.0.0-dev,<=15.0.0-dev", app_title="test-app", ease_versioning_constrains=True
+			)
+
+		self.assertIn(">=14.0.0-dev <15.0.0", str(context.exception))
+
 	def test_version_parsing_with_ease_versioning_constrains(self):
 		"""Test version parsing with ease_versioning_constrains=True basically only lower bound major version compatibility check"""
 		accepted_custom_version_strings = [
 			(">=16.0.0,<17.0.0", {"Version 16", "Nightly"}),
 			# Support stuff like alpha and dev
 			(">=17.0.0-dev,<18.0.0", {"Nightly"}),
-			(
-				">=15.75.0-alpha,<16.0.0",
-				{"Version 15", "Nightly"},
-			),  # Nightly's version number is 15 for some reason
-			(">=15.75.0,<16.0.0", {"Version 15", "Nightly"}),
-			(">=15.55.0,<15.75.0", {"Version 15", "Nightly"}),
+			(">=15.75.0-alpha,<16.0.0", {"Version 15"}),
+			(">=15.75.0,<16.0.0", {"Version 15"}),
+			(">=15.55.0,<15.75.0", {"Version 15"}),
 			(">=13.50.0,<14.0.0", {"Version 13"}),
 		]
 

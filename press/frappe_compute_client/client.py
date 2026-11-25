@@ -26,6 +26,7 @@ class Client:
 		cloud_init: str,
 		vpc_id: str,
 		private_ip_address: str,
+		assign_public_ip: bool,
 	):
 		return self.client.post_api(
 			"orchestrator.api.virtual_machine.new",
@@ -38,7 +39,14 @@ class Client:
 				"cloud_init": cloud_init,
 				"private_network": vpc_id,
 				"private_ip_address": private_ip_address,
+				"assign_public_ip": assign_public_ip,
 			},
+		)
+
+	def check_machine_availability(self, machine_type, instance_id: str | None = None):
+		return self.client.get_api(
+			"orchestrator.api.utils.check_machine_availability",
+			{"machine_type": machine_type, "instance_id": instance_id},
 		)
 
 	def sync_virtual_machine(self, instance_id: str):
@@ -52,6 +60,12 @@ class Client:
 	def start_virtual_machine(self, instance_id: str):
 		return self.client.post_api("orchestrator.api.virtual_machine.start", {"instance_id": instance_id})
 
+	def resize_virtual_machine(self, instance_id: str, machine_type: str, upgrade_disk: bool = False):
+		return self.client.post_api(
+			"orchestrator.api.virtual_machine.resize",
+			{"instance_id": instance_id, "machine_type": machine_type, "resize_disk": upgrade_disk},
+		)
+
 	def terminate_virtual_machine(self, instance_id: str):
 		return self.client.post_api(
 			"orchestrator.api.virtual_machine.terminate", {"instance_id": instance_id}
@@ -59,6 +73,20 @@ class Client:
 
 	def reboot_virtual_machine(self, instance_id: str):
 		return self.client.post_api("orchestrator.api.virtual_machine.reboot", {"instance_id": instance_id})
+
+	def remove_public_ip_from_virtual_machine(self, instance_id: str):
+		return self.client.post_api(
+			"orchestrator.api.virtual_machine.remove_public_ip", {"instance_id": instance_id}
+		)
+
+	def create_snapshot(self, instance_id: str):
+		return self.client.post_api("orchestrator.api.snapshot.new", {"instance_id": instance_id})
+
+	def sync_snapshot(self, snapshot_id: str):
+		return _dict(self.client.get_api("orchestrator.api.snapshot.sync", {"snapshot_id": snapshot_id}))
+
+	def delete_snapshot(self, snapshot_id: str):
+		return self.client.post_api("orchestrator.api.snapshot.delete", {"snapshot_id": snapshot_id})
 
 	def create_virtual_machine_image(self, instance_id: str):
 		return self.client.post_api(
@@ -68,4 +96,9 @@ class Client:
 	def sync_virtual_machine_image(self, image_id: str):
 		return _dict(
 			self.client.get_api("orchestrator.api.virtual_machine_image.sync", {"image_id": image_id})
+		)
+
+	def increase_disk_size(self, volume_id: str, size: int):
+		return self.client.post_api(
+			"orchestrator.api.disk.increase_disk_size", {"volume_id": volume_id, "size": size}
 		)

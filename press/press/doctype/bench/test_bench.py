@@ -26,6 +26,7 @@ from press.press.doctype.bench.bench import (
 	StagingSite,
 	archive_obsolete_benches,
 	archive_obsolete_benches_for_server,
+	get_frappe_release_timestamp,
 	process_bench_queue,
 )
 from press.press.doctype.deploy_candidate_difference.test_deploy_candidate_difference import (
@@ -40,6 +41,7 @@ from press.press.doctype.site.test_site import create_test_bench, create_test_si
 from press.press.doctype.site_plan.test_site_plan import create_test_plan
 from press.press.doctype.site_update.test_site_update import create_test_site_update
 from press.press.doctype.subscription.test_subscription import create_test_subscription
+from press.press.doctype.team.test_team import create_test_press_admin_team
 from press.press.doctype.version_upgrade.test_version_upgrade import (
 	create_test_version_upgrade,
 )
@@ -393,6 +395,32 @@ class TestBench(FrappeTestCase):
 		self.assertGreater(bench1.gunicorn_workers, 2)
 		self.assertGreater(bench2.gunicorn_workers, 2)
 
+	def test_get_frappe_release_timestamp_returns_commit_time_of_deployed_frappe(self):
+		bench = create_test_bench()
+		release = frappe.db.get_value("Bench App", {"parent": bench.name, "app": "frappe"}, "release")
+		commit_time = frappe.utils.add_days(frappe.utils.now_datetime(), -45)
+		frappe.db.set_value("App Release", release, "timestamp", commit_time)
+
+		self.assertEqual(get_frappe_release_timestamp(bench.name), commit_time)
+
+	def test_get_frappe_release_timestamp_falls_back_to_when_the_release_was_recorded(self):
+		bench = create_test_bench()
+		release = frappe.db.get_value("Bench App", {"parent": bench.name, "app": "frappe"}, "release")
+		recorded_at = frappe.utils.add_days(frappe.utils.now_datetime(), -45)
+		frappe.db.set_value("App Release", release, "timestamp", None)
+		frappe.db.set_value("App Release", release, "creation", recorded_at)
+
+		self.assertEqual(get_frappe_release_timestamp(bench.name), recorded_at)
+
+	def test_get_frappe_release_timestamp_is_none_when_bench_app_has_no_release(self):
+		bench = create_test_bench()
+		frappe.db.set_value("Bench App", {"parent": bench.name, "app": "frappe"}, "release", None)
+
+		self.assertIsNone(get_frappe_release_timestamp(bench.name))
+
+	def test_get_frappe_release_timestamp_is_none_without_a_bench(self):
+		self.assertIsNone(get_frappe_release_timestamp(None))
+
 
 @patch("press.press.doctype.bench.bench.frappe.db.commit", new=MagicMock)
 @patch("press.press.doctype.server.server.frappe.db.commit", new=MagicMock)
@@ -522,6 +550,80 @@ class TestArchiveObsoleteBenches(FrappeTestCase):
 		benches_after = frappe.db.count("Bench", {"status": "Active"})  # 1
 		self.assertEqual(benches_after, benches_before - 1)
 
+	@patch("press.press.doctype.bench.bench.frappe.enqueue", new=foreground_enqueue)
+	def test_fatal_site_update_doesnt_block_archival_when_site_left_both_benches(self):
+		version = "Version 15"
+		app = create_test_app()
+		app_source = create_test_app_source(version=version, app=app)
+		group = create_test_release_group([app], frappe_version=version)
+
+		with fake_agent_job("New Bench"):
+			bench1 = create_test_bench(group=group)
+			poll_pending_jobs()
+
+		site = create_test_site(bench=bench1.name, fake_agent_jobs=True)
+		create_test_app_release(app_source=app_source)
+
+		with fake_agent_job("New Bench"):
+			bench2 = create_test_bench(group=group, server=bench1.server)
+			poll_pending_jobs()
+
+		create_test_deploy_candidate_differences(bench2.candidate)  # for site update to be available
+
+		create_test_site_update(site.name, site.group, "Fatal")  # recent site update
+
+		with fake_agent_job("New Bench"):
+			unrelated_bench = create_test_bench(server=bench1.server)
+			poll_pending_jobs()
+		site.db_set(
+			"bench", unrelated_bench.name
+		)  # site moved out of the group, so neither bench1 nor bench2 can be rolled back to
+
+		benches_before = frappe.db.count("Bench", {"status": "Active", "group": group.name})  # 2
+
+		with fake_agent_job("Archive Bench"):
+			archive_obsolete_benches()
+			poll_pending_jobs()
+
+		# bench1 is archived despite the recent Fatal update, without waiting out the courtesy days
+		benches_after = frappe.db.count("Bench", {"status": "Active", "group": group.name})  # 1
+		self.assertEqual(benches_after, benches_before - 1)
+
+	@patch("press.press.doctype.bench.bench.frappe.enqueue", new=foreground_enqueue)
+	def test_fatal_site_update_doesnt_block_archival_once_cause_of_failure_is_resolved(self):
+		version = "Version 15"
+		app = create_test_app()
+		app_source = create_test_app_source(version=version, app=app)
+		group = create_test_release_group([app], frappe_version=version)
+
+		with fake_agent_job("New Bench"):
+			bench1 = create_test_bench(group=group)
+			poll_pending_jobs()
+
+		site = create_test_site(bench=bench1.name, fake_agent_jobs=True)
+		create_test_app_release(app_source=app_source)
+
+		with fake_agent_job("New Bench"):
+			bench2 = create_test_bench(group=group, server=bench1.server)
+			poll_pending_jobs()
+
+		create_test_deploy_candidate_differences(bench2.candidate)  # for site update to be available
+
+		update = create_test_site_update(site.name, site.group, "Fatal")  # recent site update
+		site.db_set("bench", bench2.name)  # site moved to new bench, but not rolled back
+
+		benches_before = frappe.db.count("Bench", {"status": "Active", "group": group.name})  # 2
+
+		update.set_cause_of_failure_is_resolved()
+
+		with fake_agent_job("Archive Bench"):
+			archive_obsolete_benches()
+			poll_pending_jobs()
+
+		# The rollback target is no longer needed once the operator resolves the cause
+		benches_after = frappe.db.count("Bench", {"status": "Active", "group": group.name})  # 1
+		self.assertEqual(benches_after, benches_before - 1)
+
 	@patch(
 		"press.press.doctype.bench.bench.archive_obsolete_benches_for_server",
 		wraps=archive_obsolete_benches_for_server,
@@ -593,6 +695,137 @@ class TestArchiveObsoleteBenches(FrappeTestCase):
 
 		self.assertEqual(site.status, "Active")
 
+	def _bench_with_a_recent_archive_failure(self) -> Bench:
+		with fake_agent_job("New Bench", "Success"):
+			group = create_test_release_group(apps=[create_test_app()], public=False)
+			bench = create_test_bench(group=group, creation=frappe.utils.add_days(None, -10))
+			poll_pending_jobs()
+
+		bench.db_set("last_archive_failure", frappe.utils.now_datetime())
+		bench.reload()
+		return bench
+
+	def test_archive_is_blocked_by_an_archive_failure_in_the_last_24_hours(self):
+		bench = self._bench_with_a_recent_archive_failure()
+
+		with self.assertRaises(ArchiveBenchError) as e:
+			bench.archive()
+		self.assertIn(
+			"A previous archive job executed in the last 24 hours has failed.",
+			str(e.exception),
+		)
+		bench.reload()
+		self.assertEqual(bench.status, "Active")
+
+	@patch("press.utils.jobs.stop_background_job", new=Mock(return_value=True))
+	def test_system_user_forces_the_archive_past_a_recent_archive_failure(self):
+		bench = self._bench_with_a_recent_archive_failure()
+
+		bench.archive(force=True)
+
+		bench.reload()
+		self.assertEqual(bench.status, "Pending")
+
+	def test_force_archive_is_ignored_for_a_user_who_is_not_a_system_user(self):
+		bench = self._bench_with_a_recent_archive_failure()
+		team = create_test_press_admin_team()
+		frappe.db.set_value("User", team.user, "user_type", "Website User")
+		frappe.clear_cache(doctype="User")
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user(team.user)
+
+		with self.assertRaises(ArchiveBenchError) as e:
+			bench.archive(force=True)
+		self.assertIn(
+			"A previous archive job executed in the last 24 hours has failed.",
+			str(e.exception),
+		)
+
+	def _group_with_a_scheduled_version_upgrade(self) -> tuple[Bench, Bench]:
+		"""Two benches of one group on one server, with an upgrade scheduled to it.
+
+		Returns the old bench and the newest one, which is where the upgrade lands.
+		"""
+		group = create_test_release_group(apps=[create_test_app()], public=False)
+		with fake_agent_job("New Bench", "Success"):
+			old_bench = create_test_bench(group=group, creation=frappe.utils.add_days(None, -10))
+			poll_pending_jobs()
+
+		with fake_agent_job("New Bench", "Success"):
+			new_bench = create_test_bench(group=group, server=old_bench.server)
+			source_bench = create_test_bench(server=old_bench.server)  # same server, other group
+			poll_pending_jobs()
+
+		site = create_test_site(bench=source_bench.name, fake_agent_jobs=True)
+		group.append("servers", {"server": old_bench.server, "default": False})
+		group.save()
+		create_test_version_upgrade(site.name, group.name)
+		return old_bench, new_bench
+
+	@patch("press.utils.jobs.stop_background_job", new=Mock(return_value=True))
+	def test_force_archive_ignores_a_version_upgrade_landing_on_another_bench(self):
+		"""The upgrade query matches the group and the server, not the bench."""
+		old_bench, _ = self._group_with_a_scheduled_version_upgrade()
+
+		with self.assertRaises(ArchiveBenchError) as e:
+			old_bench.archive()
+		self.assertIn("Version upgrade is in progress.", str(e.exception))
+
+		old_bench.archive(force=True)
+
+		old_bench.reload()
+		self.assertEqual(old_bench.status, "Pending")
+
+	def test_force_archive_does_not_drop_the_bench_a_version_upgrade_will_land_on(self):
+		"""The upgrade takes the newest active bench of the group, so it cannot go."""
+		_, new_bench = self._group_with_a_scheduled_version_upgrade()
+
+		with self.assertRaises(ArchiveBenchError) as e:
+			new_bench.archive(force=True)
+		self.assertIn("Version upgrade is in progress.", str(e.exception))
+		new_bench.reload()
+		self.assertEqual(new_bench.status, "Active")
+
+	def test_force_archive_does_not_drop_a_bench_a_site_is_migrating_to(self):
+		"""The site still points at its source bench, so the site check cannot see it."""
+		bench = self._bench_with_a_recent_archive_failure()
+		with fake_agent_job("New Bench", "Success"):
+			source_bench = create_test_bench()
+			poll_pending_jobs()
+		site = create_test_site(bench=source_bench.name, fake_agent_jobs=True)
+		frappe.get_doc(
+			{
+				"doctype": "Site Migration",
+				"site": site.name,
+				"destination_bench": bench.name,
+				"scheduled_time": frappe.utils.add_days(None, 1),
+			}
+		).insert()
+
+		with self.assertRaises(ArchiveBenchError) as e:
+			bench.archive(force=True)
+		self.assertIn(
+			f"There are pending site migrations on bench {bench.name}.",
+			str(e.exception),
+		)
+		bench.reload()
+		self.assertEqual(bench.status, "Active")
+
+	@patch("press.press.doctype.bench.bench.frappe.enqueue", new=foreground_enqueue)
+	def test_force_archive_does_not_drop_a_bench_that_still_has_sites(self):
+		bench = self._bench_with_a_recent_archive_failure()
+		site = create_test_site(bench=bench.name, fake_agent_jobs=True)
+
+		with self.assertRaises(ArchiveBenchError) as e:
+			bench.archive(force=True)
+		self.assertIn(
+			"Cannot archive bench due to unarchived sites on bench.",
+			str(e.exception),
+		)
+
+		site.reload()
+		self.assertEqual(site.status, "Active")
+
 	def test_if_any_ongoing_jobs_are_running_on_bench(self):
 		with fake_agent_job({"New Bench": {"status": "Success"}, "Add User to Proxy": {"status": "Success"}}):
 			bench = create_test_bench()
@@ -602,6 +835,12 @@ class TestArchiveObsoleteBenches(FrappeTestCase):
 			with self.assertRaises(ArchiveBenchError):
 				bench.archive()
 			bench.reload()
+
+	def test_bench_config_marks_bench_as_frappe_cloud_managed(self):
+		"""bench reads this key to warn before commands that desync the container."""
+		with fake_agent_job({"New Bench": {"status": "Success"}, "Add User to Proxy": {"status": "Success"}}):
+			bench = create_test_bench()
+			self.assertTrue(json.loads(bench.config)["frappe_cloud"])
 
 	def test_bench_and_release_group_redis_password(self):
 		with fake_agent_job({"New Bench": {"status": "Success"}, "Add User to Proxy": {"status": "Success"}}):

@@ -17,6 +17,7 @@ from rq.timeouts import JobTimeoutException
 from press.api.client import dashboard_whitelist
 from press.overrides import get_permission_query_conditions_for_doctype
 from press.press.doctype.deploy_candidate_build.deploy_candidate_build import create_platform_build_and_deploy
+from press.press.doctype.site_migration.site_migration import get_ongoing_migration
 from press.utils.jobs import has_job_timeout_exceeded
 
 if TYPE_CHECKING:
@@ -63,6 +64,7 @@ class SiteAction(Document):
 			"Move From Private To Shared Bench",
 			"Move Site To Different Server / Bench",
 			"Move Site To Different Region",
+			"Move Site To Another Shared Server",
 		]
 		arguments: DF.SmallText
 		destination_bench: DF.Link | None
@@ -85,6 +87,13 @@ class SiteAction(Document):
 			return [
 				(self.pre_validate_move_site_to_different_cluster, StepType.Validation),
 				(self.process_move_site_to_different_cluster, StepType.Main),
+			]
+
+		if self.action_type == "Move Site To Another Shared Server":
+			return [
+				(self.pre_validate_move_site_to_another_shared_server, StepType.Validation),
+				(self.deploy_bench_on_shared_server, StepType.Preparation),
+				(self.move_site_to_another_shared_server, StepType.Main),
 			]
 
 		if self.action_type == "Move Site To Different Server / Bench":
@@ -223,6 +232,9 @@ class SiteAction(Document):
 							# Ideally this should never happen
 							# but to avoid infinite loop, we will break after 100 attempts and raise the error
 							raise e
+
+				# Remembered so a failed build archives this group and no other
+				self.set_argument("created_release_group", new_group.name)
 
 			# Set essential arguments for next steps
 			self.set_argument("destination_server", self.get_argument("destination_server", site.server))
@@ -373,6 +385,26 @@ class SiteAction(Document):
 		self.save()
 		return StepStatus.Running
 
+	# Move Site to Another Shared Server
+	def pre_validate_move_site_to_another_shared_server(self):
+		"""Pre Validate Move Site To Another Shared Server"""
+		site: Site = self.site_doc
+		# This action is already in the table, so it must not block itself
+		site.validate_shared_server_move_cooldown(exclude_action=self.name)
+		destination = site.pick_shared_server_for_migration(self.get_argument("destination_server"))
+
+		self.set_argument("destination_server", destination["name"])
+		# The site keeps its own bench group, wherever that bench has to be built
+		self.set_argument("destination_release_group", site.group)
+
+	def deploy_bench_on_shared_server(self):
+		"""Deploy the Bench on the Shared Server"""
+		return self.clone_and_create_bench_group()
+
+	def move_site_to_another_shared_server(self):
+		"""Move Site To Another Shared Server"""
+		return self.move_site_to_bench_group()
+
 	# Move Site to Different Cluster
 	def pre_validate_move_site_to_different_cluster(self):
 		"""Pre Validate Move Site To Different Cluster"""
@@ -380,7 +412,9 @@ class SiteAction(Document):
 		target_cluster = self.get_argument("cluster")
 		current_cluster = frappe.db.get_value("Server", self.site_doc.server, "cluster")
 		if target_cluster == current_cluster:
-			frappe.throw("Target cluster must be different from current cluster.")
+			frappe.throw(
+				"The site is already in the selected region. Please choose a different region to move it to."
+			)
 
 		# create the `Site Migration`
 		current_group = frappe.db.get_value("Site", self.site, "group")
@@ -395,14 +429,21 @@ class SiteAction(Document):
 
 		bench, server = bench_vals
 
+		self._schedule_site_migration(group=current_group, bench=bench, server=server, cluster=target_cluster)
+
+	def process_move_site_to_different_cluster(self):
+		"""Move Site To Different Cluster"""
+		return self._process_scheduled_site_migration()
+
+	def _schedule_site_migration(self, group: str, bench: str, server: str, cluster: str) -> None:
 		site_migration: SiteMigration = frappe.get_doc(
 			{
 				"doctype": "Site Migration",
 				"site": self.site,
-				"destination_group": current_group,
+				"destination_group": group,
 				"destination_bench": bench,
 				"destination_server": server,
-				"destination_cluster": target_cluster,
+				"destination_cluster": cluster,
 				"scheduled_time": self.scheduled_time_formatted,
 				"skip_failing_patches": self.get_argument("skip_failing_patches", False),
 			}
@@ -410,33 +451,35 @@ class SiteAction(Document):
 
 		self.set_argument("site_migration", site_migration.name)
 
-	def process_move_site_to_different_cluster(self):
-		"""Move Site To Different Cluster"""
-		if self.current_step.reference_doctype == "Site Migration" and self.current_step.reference_name:
+	def _process_scheduled_site_migration(self) -> str:
+		step = self.current_step
+		assert step, "A step method only runs while its step is current"
+
+		if step.reference_doctype == "Site Migration" and step.reference_name:
 			# Site Migration is already scheduled
-			doc = frappe.get_doc("Site Migration", self.current_step.reference_name)
-			if doc.status == "Success":
+			status = frappe.db.get_value("Site Migration", step.reference_name, "status")
+			if status == "Success":
 				return StepStatus.Success
-			if doc.status == "Failure":
+			if status == "Failure":
 				return StepStatus.Failure
 			return StepStatus.Running
 
-		self.current_step.reference_doctype = "Site Migration"
-		self.current_step.reference_name = self.get_argument("site_migration")
+		step.reference_doctype = "Site Migration"
+		step.reference_name = self.get_argument("site_migration")
 		return StepStatus.Running
 
 	def _archive_newly_created_release_group(self):
 		# If Release Group is 'Awaiting Deploy'
 		from press.press.doctype.release_group.release_group import get_status
 
-		# Try to remove it
+		# Only the group this action cloned, never a group the site already had
 		with contextlib.suppress(frappe.DoesNotExistError):
-			release_group_name = self.get_argument("destination_release_group")
+			release_group_name = self.get_argument("created_release_group")
 			if release_group_name and get_status(release_group_name) == "Awaiting Deploy":
 				release_group: ReleaseGroup = frappe.get_doc("Release Group", release_group_name)
 				release_group.archive()
 
-	def get_press_error_notifications(self) -> list[dict]:  # noqa: C901
+	def get_press_error_notifications(self) -> list[dict]:
 		if self.status != "Failure":
 			return []
 
@@ -446,47 +489,27 @@ class SiteAction(Document):
 				continue
 			if not step.reference_doctype or not step.reference_name:
 				continue
-			if step.reference_doctype == "Deploy Candidate Build":
-				notifications.extend(
-					frappe.get_all(
-						"Press Notification",
-						filters={
-							"team": self.team,
-							"type": "Bench Deploy",
-							"document_type": step.reference_doctype,
-							"document_name": step.reference_name,
-							"class": "Error",
-							"is_actionable": True,
-						},
-						fields=["title", "name"],
-					)
-				)
-
-			elif step.reference_doctype == "Site Update":
-				agent_jobs = []
-				site_update_doc: SiteUpdate = frappe.get_doc(step.reference_doctype, step.reference_name)
-				if site_update_doc.update_job:
-					agent_jobs.append(site_update_doc.update_job)
-				if site_update_doc.recover_job:
-					agent_jobs.append(site_update_doc.recover_job)
-
-				if agent_jobs:
-					notifications.extend(
-						frappe.get_all(
-							"Press Notification",
-							filters={
-								"team": self.team,
-								"type": "Site Update",
-								"document_type": "Agent Job",
-								"document_name": ("in", agent_jobs),
-								"class": "Error",
-								"is_actionable": True,
-							},
-							fields=["title", "name"],
-						)
-					)
+			notifications.extend(self.get_notifications_for_step(step))
 
 		return notifications
+
+	def get_notifications_for_step(self, step: SiteActionStep) -> list[dict]:
+		if step.reference_doctype == "Deploy Candidate Build":
+			return get_actionable_notifications(
+				self.team, "Bench Deploy", "Deploy Candidate Build", [step.reference_name]
+			)
+
+		if step.reference_doctype == "Site Update":
+			return get_actionable_notifications(
+				self.team, "Site Update", "Agent Job", get_site_update_jobs(step.reference_name)
+			)
+
+		if step.reference_doctype == "Site Migration":
+			return get_actionable_notifications(
+				self.team, "Site Migrate", "Agent Job", get_site_migration_jobs(step.reference_name)
+			)
+
+		return []
 
 	# Internal
 
@@ -506,7 +529,7 @@ class SiteAction(Document):
 			)
 
 	def before_insert(self):
-		# Check if no other site action is running for the same site
+		# Check if no other site action/migration is running for the same site
 		if frappe.db.exists(
 			"Site Action",
 			{
@@ -516,6 +539,11 @@ class SiteAction(Document):
 		):
 			frappe.throw(
 				"Another site action is already scheduled / running for this site. Please wait for it to complete before starting a new one."
+			)
+
+		if get_ongoing_migration(self.site, scheduled=True):
+			frappe.throw(
+				f"Ongoing/Scheduled Site Migration for the site {frappe.bold(self.site)} exists, retry once it is completed"
 			)
 
 		# If any key is blank string or None, remove it from arguments
@@ -534,7 +562,9 @@ class SiteAction(Document):
 
 	def validate(self):
 		if self.action_type == "Move From Private To Shared Bench":
-			frappe.throw("Move From Private To Shared Bench action is not available currently.")
+			frappe.throw(
+				"Moving a site from a private bench to a shared bench isn't available right now. Please contact support if you need to do this."
+			)
 
 	def on_update(self):
 		save_doc = False
@@ -620,7 +650,9 @@ class SiteAction(Document):
 	@dashboard_whitelist()
 	def cancel_action(self):
 		if self.status != "Scheduled":
-			frappe.throw("Only Scheduled actions can be cancelled.")
+			frappe.throw(
+				"Only scheduled actions can be cancelled. This action has already started or finished, so it can no longer be cancelled."
+			)
 			return
 
 		self.status = "Cancelled"
@@ -628,18 +660,18 @@ class SiteAction(Document):
 			if step.status in ("Pending", "Running"):
 				step.status = "Skipped"
 
-		if self.action_type == "Move Site To Different Region":
-			site_migration_name = self.get_argument("site_migration")
-			if site_migration_name and frappe.db.exists("Site Migration", site_migration_name):
-				status = frappe.db.get_value("Site Migration", site_migration_name, "status", for_update=True)
-				if status != "Scheduled":
-					frappe.throw(
-						"Site Migration is already in progress. Cannot cancel the action.",
-						frappe.ValidationError,
-					)
-					return
+		# Actions that schedule the migration up front have to take it back
+		site_migration_name = self.get_argument("site_migration")
+		if site_migration_name and frappe.db.exists("Site Migration", site_migration_name):
+			status = frappe.db.get_value("Site Migration", site_migration_name, "status", for_update=True)
+			if status != "Scheduled":
+				frappe.throw(
+					"Site Migration is already in progress. Cannot cancel the action.",
+					frappe.ValidationError,
+				)
+				return
 
-				frappe.delete_doc("Site Migration", site_migration_name, ignore_permissions=True)
+			frappe.delete_doc("Site Migration", site_migration_name, ignore_permissions=True)
 
 		self.save(ignore_version=True)
 
@@ -815,8 +847,11 @@ class SiteAction(Document):
 		rg_apps.discard("frappe")
 		site_apps.discard("frappe")
 		if diff := site_apps - rg_apps:
+			apps = ", ".join(frappe.bold(app) for app in diff)
+			install = "<a class='underline' href='https://docs.frappe.io/cloud/installing-an-app#bench-group'>install</a>"
+			remove = "<a class='underline' href='https://docs.frappe.io/cloud/how-to-uninstall-an-app-from-the-site'>remove</a>"
 			frappe.throw(
-				f"Site has following apps {', '.join(diff)} which are not present in the destination release group. Please install those apps in the destination release group or remove them from the site before moving.",
+				f"Site has following apps: {apps} which are not present in the destination release group. Please {install} those apps in the destination release group or {remove} them from the site before moving.",
 				frappe.ValidationError,
 			)
 
@@ -841,6 +876,42 @@ get_permission_query_conditions = get_permission_query_conditions_for_doctype("S
 
 
 # Utility functions
+
+
+def get_actionable_notifications(
+	team: str, notification_type: str, document_type: str, document_names: list[str]
+) -> list[dict]:
+	"""Error notifications the user can act on, shown as a banner on the action page."""
+	if not document_names:
+		return []
+
+	return frappe.get_all(
+		"Press Notification",
+		filters={
+			"team": team,
+			"type": notification_type,
+			"document_type": document_type,
+			"document_name": ("in", document_names),
+			"class": "Error",
+			"is_actionable": True,
+		},
+		fields=["title", "name"],
+	)
+
+
+def get_site_update_jobs(site_update: str) -> list[str]:
+	jobs = frappe.db.get_value("Site Update", site_update, ["update_job", "recover_job"]) or []
+	return [job for job in jobs if job]
+
+
+def get_site_migration_jobs(site_migration: str) -> list[str]:
+	"""Agent jobs of a migration's failed steps. That's where the failure gets notified from."""
+	jobs = frappe.get_all(
+		"Site Migration Step",
+		filters={"parent": site_migration, "parenttype": "Site Migration", "status": "Failure"},
+		pluck="step_job",
+	)
+	return [job for job in jobs if job]
 
 
 def process_site_actions():

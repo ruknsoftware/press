@@ -1,6 +1,6 @@
 <template>
 	<div class="upi-autopay-form">
-		<p class="mb-6 text-p-base text-gray-700">
+		<p class="mb-6 text-p-base text-ink-gray-7">
 			Simplify your billing by authorizing
 			<strong>recurring monthly payments</strong> for your Frappe Cloud invoices
 			via Razorpay. Once set up, we’ll handle your future invoices
@@ -14,10 +14,10 @@
 			:max="100000"
 			placeholder="50000"
 		/>
-		<div class="mt-2 text-p-sm text-gray-600">
+		<div class="mt-2 text-p-sm text-ink-gray-6">
 			<div class="font-medium">Range: ₹500 - ₹1,00,000</div>
 
-			<div class="mt-2 text-gray-500 italic">
+			<div class="mt-2 text-ink-gray-5 italic">
 				<strong>Important:</strong> If an invoice exceeds this limit, the
 				auto-debit will fail. Set this slightly higher than your typical bill to
 				ensure uninterrupted service.
@@ -44,6 +44,7 @@
 <script>
 import { FormControl, Button, ErrorMessage } from 'frappe-ui';
 import { toast } from 'vue-sonner';
+import { loadRazorpayScript } from '../../utils/razorpay';
 
 export default {
 	name: 'UPIAutopayForm',
@@ -64,7 +65,7 @@ export default {
 		};
 	},
 	mounted() {
-		this.loadRazorpayScript();
+		loadRazorpayScript();
 		if (this.isBackground) {
 			this.$resources.createRazorpayMandate.submit();
 		}
@@ -108,14 +109,6 @@ export default {
 		},
 	},
 	methods: {
-		loadRazorpayScript() {
-			if (window.Razorpay) return;
-			const script = document.createElement('script');
-			script.src = 'https://checkout.razorpay.com/v1/checkout.js';
-			script.async = true;
-			document.head.appendChild(script);
-		},
-
 		setupAutopay() {
 			if (!this.maxAmount || this.maxAmount < 500) {
 				toast.error('Maximum amount must be at least ₹500');
@@ -129,7 +122,8 @@ export default {
 			// this.$resources.createRazorpayMandate.submit();
 		},
 
-		openRazorpayCheckout(orderData) {
+		async openRazorpayCheckout(orderData) {
+			await loadRazorpayScript();
 			const options = {
 				key: orderData.key_id,
 				order_id: orderData.order_id,

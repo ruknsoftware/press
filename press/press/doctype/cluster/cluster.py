@@ -16,16 +16,19 @@ import frappe
 import oci
 import pydo
 from frappe.model.document import Document
+from frappe.query_builder import Criterion
+from frappe.query_builder.functions import Count, Sum
 from hcloud import APIException, Client
 from hcloud.firewalls.domain import FirewallRule as HetznerFirewallRule
 from hcloud.networks.domain import NetworkSubnet
 from oci.config import validate_config
-from oci.core import VirtualNetworkClient
+from oci.core import ComputeClient, VirtualNetworkClient
 from oci.core.models import (
 	AddNetworkSecurityGroupSecurityRulesDetails,
 	AddSecurityRuleDetails,
 	CreateInternetGatewayDetails,
 	CreateNetworkSecurityGroupDetails,
+	CreateRouteTableDetails,
 	CreateSubnetDetails,
 	CreateVcnDetails,
 	PortRange,
@@ -33,6 +36,7 @@ from oci.core.models import (
 	TcpOptions,
 	UdpOptions,
 	UpdateRouteTableDetails,
+	UpdateVnicDetails,
 )
 from oci.identity import IdentityClient
 
@@ -69,6 +73,7 @@ class Cluster(Document):
 		availability_zone: DF.Data | None
 		aws_access_key_id: DF.Data | None
 		aws_secret_access_key: DF.Password | None
+		backup_bucket: DF.Link
 		beta: DF.Check
 		by_default_select_unified_mode: DF.Check
 		cidr_block: DF.Data | None
@@ -80,20 +85,25 @@ class Cluster(Document):
 		default_db_server_plan_type: DF.Link | None
 		description: DF.Data | None
 		digital_ocean_api_token: DF.Password | None
+		disable_public_ips_for_servers: DF.Check
 		enable_autoscaling: DF.Check
 		enable_periodic_flush_table: DF.Check
+		flow_log_id: DF.Data | None
 		flush_table_execution_hour: DF.Int
 		frappe_compute_api_key: DF.Data | None
 		frappe_compute_api_secret: DF.Password | None
 		frappe_compute_base_url: DF.Data | None
 		has_add_on_storage_support: DF.Check
 		has_arm_support: DF.Check
-		hetzner_api_token: DF.Password | None
 		has_unified_server_support: DF.Check
+		hetzner_api_token: DF.Password | None
 		hybrid: DF.Check
 		image: DF.AttachImage | None
+		mariadb_monitor_password: DF.Password | None
 		monitoring_password: DF.Password | None
+		nat_security_group_id: DF.Data | None
 		network_acl_id: DF.Data | None
+		oci_nat_route_table_id: DF.Data | None
 		oci_private_key: DF.Password | None
 		oci_public_key: DF.Code | None
 		oci_tenancy: DF.Data | None
@@ -110,6 +120,8 @@ class Cluster(Document):
 		subnet_id: DF.Data | None
 		team: DF.Link | None
 		title: DF.Data | None
+		vpc_flow_logs_enabled: DF.Check
+		vpc_flow_logs_s3_bucket: DF.Data | None
 		vpc_id: DF.Data | None
 	# end: auto-generated types
 
@@ -130,6 +142,24 @@ class Cluster(Document):
 	secondary_server_series: ClassVar[str] = "fs"
 	unified_server_series: ClassVar[str] = "u"
 
+	# Maps first letter of AWS instance type to its vCPU service-quota code.
+	# Standard bucket (A/C/D/H/I/M/R/T/Z) shares one quota code.
+	_AWS_INSTANCE_FAMILY_QUOTA_CODES: ClassVar[dict[str, str]] = {
+		"a": "L-1216C47A",
+		"c": "L-1216C47A",
+		"d": "L-1216C47A",
+		"h": "L-1216C47A",
+		"i": "L-1216C47A",
+		"m": "L-1216C47A",
+		"r": "L-1216C47A",
+		"t": "L-1216C47A",
+		"z": "L-1216C47A",
+		"f": "L-74FC7D96",
+		"g": "L-DB2E81BA",
+		"p": "L-97A4D03C",
+		"x": "L-7295265B",
+	}
+
 	wait_for_aws_creds_seconds = 20
 
 	@staticmethod
@@ -147,6 +177,7 @@ class Cluster(Document):
 	def validate(self):
 		self.validate_flush_table_execution_hour()
 		self.validate_monitoring_password()
+		self.validate_mariadb_monitor_password()
 		self.validate_cidr_block()
 		if self.cloud_provider == "AWS EC2":
 			self.validate_aws_credentials()
@@ -176,12 +207,16 @@ class Cluster(Document):
 			servers = client.servers.get_all()
 
 			if servers is None:
-				frappe.throw("API token does not have read access to the Hetzner Cloud.")
+				frappe.throw(
+					"This Hetzner Cloud API token doesn't have read access. Please generate a token with read and write permissions and enter it again."
+				)
 
 		except APIException as e:
 			# Handle specific API exceptions like unauthorized access
 			if e.code == "unauthorized":
-				frappe.throw("API token is invalid or does not have the correct permissions.")
+				frappe.throw(
+					"This Hetzner Cloud API token is invalid or lacks the required permissions. Please generate a new token with read and write access and enter it again."
+				)
 			else:
 				frappe.throw(f"An error occurred while validating the API token: {e}")
 
@@ -218,7 +253,9 @@ class Cluster(Document):
 				"Flush Table Execution Hour is required when Enable Periodic Flush Table is checked."
 			)
 		if not (0 <= self.flush_table_execution_hour <= 23):
-			frappe.throw("Flush Table Execution Hour must be between 0 and 23.")
+			frappe.throw(
+				"Please enter the flush table execution hour as a number between 0 and 23 (24-hour clock)."
+			)
 
 	def after_insert(self):
 		if self.cloud_provider == "AWS EC2":
@@ -254,6 +291,8 @@ class Cluster(Document):
 		self._add_digital_ocean_firewall(client=client)
 		# Add proxy firewall to digital ocean, if it doesn't already exist
 		self._add_digital_ocean_proxy_firewall(client=client)
+		# Add NAT firewall to digital ocean, if it doesn't already exist
+		self._add_digital_ocean_nat_security_group(client=client)
 
 		self.save()
 
@@ -318,6 +357,66 @@ class Cluster(Document):
 		except Exception as e:
 			frappe.throw(f"Failed to create Proxy Firewall on Digital Ocean: {e!s}")
 
+	def _add_digital_ocean_nat_security_group(self, client):
+		"""Adds the NAT firewall to Digital Ocean if it doesn't already exist"""
+
+		firewalls = client.firewalls.list()
+		firewalls = firewalls.get("firewalls", [])
+
+		firewall_name = f"Frappe Cloud - {self.name} - NAT - Security Group".replace(" ", "")
+
+		existing_firewalls = [fw for fw in firewalls if fw["name"] == firewall_name]
+
+		if existing_firewalls:
+			self.nat_security_group_id = existing_firewalls[0]["id"]
+			return
+
+		try:
+			firewall = client.firewalls.create(
+				{
+					"name": firewall_name,
+					"inbound_rules": [
+						{
+							"protocol": "tcp",
+							"ports": "1-65535",
+							"sources": {"addresses": [self.subnet_cidr_block]},
+						},
+						{
+							"protocol": "udp",
+							"ports": "1-65535",
+							"sources": {"addresses": [self.subnet_cidr_block]},
+						},
+						{
+							"protocol": "icmp",
+							"ports": "0",
+							"sources": {"addresses": [self.subnet_cidr_block]},
+						},
+					],
+					"outbound_rules": [
+						{
+							"protocol": "tcp",
+							"ports": "0",
+							"destinations": {"addresses": ["0.0.0.0/0"]},
+						},
+						{
+							"protocol": "udp",
+							"ports": "0",
+							"destinations": {"addresses": ["0.0.0.0/0"]},
+						},
+						{
+							"protocol": "icmp",
+							"ports": "0",
+							"destinations": {"addresses": ["0.0.0.0/0"]},
+						},
+					],
+				}
+			)
+
+			self.nat_security_group_id = firewall["firewall"]["id"]
+
+		except Exception as e:
+			frappe.throw(f"Failed to create NAT Firewall on Digital Ocean: {e!s}")
+
 	def _add_digital_ocean_firewall(self, client):
 		"""Adds the firewall to Digital Ocean if it doesn't already exist"""
 		firewalls = client.firewalls.list()
@@ -370,7 +469,9 @@ class Cluster(Document):
 			)
 
 			if "id" not in firewall.get("firewall", {}):
-				frappe.throw("Failed to create Firewall on Digital Ocean.")
+				frappe.throw(
+					"Failed to create the firewall on DigitalOcean. Please check the DigitalOcean API token and retry."
+				)
 
 			self.security_group_id = firewall["firewall"]["id"]
 		except Exception as e:
@@ -379,6 +480,38 @@ class Cluster(Document):
 		frappe.msgprint(
 			"To add this cluster to monitoring, go to the Monitor Server and trigger the 'Reconfigure Monitor Server' action from the Actions menu."
 		)
+
+	def add_hetzner_nat_route(self, nat_ip):
+		from hcloud.networks.domain import NetworkRoute
+
+		client = self.get_hetzner_client()
+
+		network = client.networks.get_by_id(int(self.vpc_id))
+		if not network:
+			frappe.throw(f"Hetzner network {self.vpc_id} not found")
+
+		for route in network.routes:
+			if route.destination == "0.0.0.0/0":
+				if route.gateway == nat_ip:
+					return
+
+				action = client.networks.delete_route(
+					network=network,
+					route=route,
+				)
+				action.wait_until_finished()
+
+				break
+
+		action = client.networks.add_route(
+			network=network,
+			route=NetworkRoute(
+				destination="0.0.0.0/0",
+				gateway=nat_ip,
+			),
+		)
+
+		action.wait_until_finished()
 
 	def provision_on_hetzner(self):
 		try:
@@ -511,6 +644,8 @@ class Cluster(Document):
 		except APIException as e:
 			frappe.throw(f"Failed to provision proxy server firewall on Hetzner: {e!s}")
 
+		self.create_nat_security_group_hetzner()
+
 	def on_trash(self):
 		machines = frappe.get_all(
 			"Virtual Machine",
@@ -562,6 +697,35 @@ class Cluster(Document):
 	def validate_monitoring_password(self):
 		if not self.monitoring_password:
 			self.monitoring_password = frappe.generate_hash()
+
+	def validate_mariadb_monitor_password(self):
+		if not self.mariadb_monitor_password:
+			self.mariadb_monitor_password = frappe.generate_hash(length=32)
+
+	@frappe.whitelist(methods=["POST"])
+	def rotate_mariadb_monitor_password(self):
+		frappe.enqueue_doc(
+			self.doctype,
+			self.name,
+			"_rotate_mariadb_monitor_password",
+			queue="long",
+			timeout=7200,
+			enqueue_after_commit=True,
+		)
+
+	def _rotate_mariadb_monitor_password(self):
+		"""ProxySQL health checks fail between the two steps, so run them back to back."""
+		from press.press.doctype.database_server.database_server import DatabaseServer
+		from press.press.doctype.proxy_server.proxy_server import ProxyServer
+
+		for name in frappe.get_all(
+			"Database Server", {"cluster": self.name, "status": "Active", "is_primary": 1}, pluck="name"
+		):
+			DatabaseServer("Database Server", name)._update_mariadb_monitor_password()
+		for name in frappe.get_all(
+			"Proxy Server", {"cluster": self.name, "status": "Active", "is_proxysql_setup": 1}, pluck="name"
+		):
+			ProxyServer("Proxy Server", name)._setup_proxysql_monitor()
 
 	def provision_on_aws_ec2(self):
 		client = self.get_aws_client()
@@ -734,6 +898,7 @@ class Cluster(Document):
 			],
 		)
 		self.create_proxy_security_group()
+		self.create_nat_security_group()
 
 		try:  # noqa: SIM105
 			# We don't care if the key already exists in this region
@@ -790,6 +955,209 @@ class Cluster(Document):
 					"IpProtocol": "tcp",
 					"IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "MariaDB from anywhere"}],
 					"ToPort": 3306,
+				},
+			],
+		)
+
+	def create_nat_security_group_hetzner(self):
+		client = self.get_hetzner_client()
+
+		# Reuse existing firewall if already created
+		if self.nat_security_group_id:
+			try:
+				firewall = client.firewalls.get_by_id(int(self.nat_security_group_id))
+				if firewall:
+					return firewall
+			except APIException:
+				pass
+
+		try:
+			response = client.firewalls.create(
+				name=f"Frappe Cloud - {self.name} - NAT - Security Group",
+				rules=[
+					HetznerFirewallRule(
+						description="Allow TCP from private network",
+						direction="in",
+						protocol="tcp",
+						port="1-65535",
+						source_ips=[self.subnet_cidr_block],
+					),
+					HetznerFirewallRule(
+						description="Allow UDP from private network",
+						direction="in",
+						protocol="udp",
+						port="1-65535",
+						source_ips=[self.subnet_cidr_block],
+					),
+					HetznerFirewallRule(
+						description="Allow ICMP from private network",
+						direction="in",
+						protocol="icmp",
+						source_ips=[self.subnet_cidr_block],
+					),
+				],
+			)
+
+			self.nat_security_group_id = response.firewall.id
+			self.save()
+
+			return response.firewall
+
+		except APIException as e:
+			frappe.throw(
+				f"Failed to provision NAT firewall on Hetzner. "
+				f"Please verify Hetzner API access and firewall configuration. Error: {e!s}"
+			)
+
+	def create_nat_security_group_oci(self):
+		vcn_client = VirtualNetworkClient(self.get_oci_config())
+
+		# Reuse existing NSG if already created
+		if self.nat_security_group_id:
+			try:
+				return vcn_client.get_network_security_group(self.nat_security_group_id).data
+			except Exception:
+				pass
+
+		time.sleep(1)
+		nat_security_group = vcn_client.create_network_security_group(
+			CreateNetworkSecurityGroupDetails(
+				compartment_id=self.oci_tenancy,
+				display_name=f"Frappe Cloud - {self.name} - NAT - Security Group",
+				vcn_id=self.vpc_id,
+			)
+		).data
+		self.nat_security_group_id = nat_security_group.id
+
+		time.sleep(1)
+		vcn_client.add_network_security_group_security_rules(
+			self.nat_security_group_id,
+			AddNetworkSecurityGroupSecurityRulesDetails(
+				security_rules=[
+					AddSecurityRuleDetails(
+						description="Allow TCP from private network",
+						direction="INGRESS",
+						protocol="6",
+						source=self.subnet_cidr_block,
+						tcp_options=TcpOptions(destination_port_range=PortRange(min=1, max=65535)),
+					),
+					AddSecurityRuleDetails(
+						description="Allow UDP from private network",
+						direction="INGRESS",
+						protocol="17",
+						source=self.subnet_cidr_block,
+						udp_options=UdpOptions(destination_port_range=PortRange(min=1, max=65535)),
+					),
+					AddSecurityRuleDetails(
+						description="Allow ICMP from private network",
+						direction="INGRESS",
+						protocol="1",
+						source=self.subnet_cidr_block,
+					),
+				],
+			),
+		)
+
+		self.save()
+
+		return nat_security_group
+
+	def create_nat_route_table_oci(self, nat_vm_private_ip: str):
+		# Called when we create NAT VM
+		vcn_client = VirtualNetworkClient(self.get_oci_config())
+
+		private_ip = vcn_client.list_private_ips(
+			subnet_id=self.subnet_id,
+			ip_address=nat_vm_private_ip,
+		).data
+
+		if not private_ip:
+			frappe.throw(
+				f"Private IP {nat_vm_private_ip} not found. "
+				f"Please verify the private IP address and subnet configuration."
+			)
+
+		route_table = vcn_client.create_route_table(
+			CreateRouteTableDetails(
+				compartment_id=self.oci_tenancy,
+				vcn_id=self.vpc_id,
+				display_name=f"Frappe Cloud - {self.name} - NAT Route Table",
+				route_rules=[
+					RouteRule(
+						destination="0.0.0.0/0",
+						destination_type="CIDR_BLOCK",
+						network_entity_id=private_ip[0].id,
+					),
+				],
+			)
+		).data
+
+		self.oci_nat_route_table_id = route_table.id
+		self.save()
+
+		return route_table.id
+
+	def attach_route_table_to_instance_vnic_oci(self, instance: VirtualMachine, nat_route_table_id: str):
+		# Called when we create private instances or during IP removal process
+		# Used to attach/replace the default route table of the VNIC attached to the instance to the NAT route table
+		compute_client = ComputeClient(self.get_oci_config())
+		network_client = VirtualNetworkClient(self.get_oci_config())
+
+		vnic_attachments = compute_client.list_vnic_attachments(
+			compartment_id=self.oci_tenancy,
+			instance_id=instance.instance_id,
+		).data
+
+		if not vnic_attachments:
+			frappe.throw(
+				f"No VNIC attached to instance {instance.instance_id}. "
+				f"Please verify the instance configuration."
+			)
+
+		try:
+			network_client.update_vnic(
+				vnic_attachments[0].vnic_id,
+				UpdateVnicDetails(
+					route_table_id=nat_route_table_id,
+				),
+			)
+		except Exception as e:
+			frappe.throw(
+				f"Failed to attach NAT route table {nat_route_table_id} to VNIC {vnic_attachments[0].vnic_id}. "
+				f"Error: {e!s}"
+			)
+
+	def create_nat_security_group(self):
+		client = self.get_aws_client()
+		response = client.create_security_group(
+			GroupName=f"Frappe Cloud - {self.name} - NAT - Security Group",
+			Description="Allow Inbound Traffic on NAT",
+			VpcId=self.vpc_id,
+			TagSpecifications=[
+				{
+					"ResourceType": "security-group",
+					"Tags": [
+						{
+							"Key": "Name",
+							"Value": f"Frappe Cloud - {self.name} - NAT - Security Group",
+						},
+					],
+				},
+			],
+		)
+		self.nat_security_group_id = response["GroupId"]
+
+		client.authorize_security_group_ingress(
+			GroupId=self.nat_security_group_id,
+			IpPermissions=[
+				{
+					"IpProtocol": "-1",
+					"IpRanges": [
+						{
+							"CidrIp": self.subnet_cidr_block,
+							"Description": "Allow everything from private network",
+						}
+					],
 				},
 			],
 		)
@@ -920,6 +1288,11 @@ class Cluster(Document):
 		self.proxy_security_group_id = proxy_security_group.id
 
 		time.sleep(1)
+
+		self.create_nat_security_group_oci()
+
+		time.sleep(1)
+
 		vcn_client.add_network_security_group_security_rules(  # noqa: B018
 			self.proxy_security_group_id,
 			AddNetworkSecurityGroupSecurityRulesDetails(
@@ -1067,6 +1440,51 @@ class Cluster(Document):
 		yield from copies
 
 	@frappe.whitelist()
+	def assign_nat_security_group(self):
+		if self.cloud_provider == "AWS EC2":
+			self.create_nat_security_group()
+			self.save()
+		elif self.cloud_provider == "Hetzner":
+			self.create_nat_security_group_hetzner()
+		elif self.cloud_provider == "OCI":
+			self.create_nat_security_group_oci()
+
+	@frappe.whitelist()
+	def setup_vpc_flow_logs(self):
+		"""Create an S3-delivered, ALL-traffic flow log for this cluster's VPC."""
+		if self.cloud_provider != "AWS EC2":
+			frappe.throw("VPC Flow Logs are only supported on AWS EC2", frappe.ValidationError)
+		if self.status != "Active":
+			frappe.throw("Cluster is not active", frappe.ValidationError)
+		if not self.vpc_id:
+			frappe.throw("Cluster has no VPC", frappe.ValidationError)
+		if self.vpc_flow_logs_enabled:
+			frappe.throw("VPC Flow Logs are already enabled", frappe.ValidationError)
+		if not self.vpc_flow_logs_s3_bucket:
+			frappe.throw("Set the VPC Flow Logs S3 bucket on the cluster first", frappe.ValidationError)
+
+		response = self.get_aws_client().create_flow_logs(
+			ResourceType="VPC",
+			ResourceIds=[self.vpc_id],
+			TrafficType="ALL",
+			LogDestinationType="s3",
+			LogDestination=f"arn:aws:s3:::{self.vpc_flow_logs_s3_bucket}",
+			TagSpecifications=[
+				{
+					"ResourceType": "vpc-flow-log",
+					"Tags": [{"Key": "Name", "Value": f"Frappe Cloud - {self.name} - Flow Logs"}],
+				},
+			],
+		)
+		# Fail loud at the boundary: CreateFlowLogs returns partial success.
+		if response.get("Unsuccessful"):
+			error = response["Unsuccessful"][0].get("Error", {})
+			frappe.throw(f"Failed to create VPC Flow Logs: {error.get('Message', error)}")
+		self.flow_log_id = response["FlowLogIds"][0]
+		self.vpc_flow_logs_enabled = 1
+		self.save()
+
+	@frappe.whitelist()
 	def create_proxy(self):
 		"""Creates a proxy server for the cluster"""
 		if self.get_same_region_vmis(get_series=True).count("n") < 1:
@@ -1124,6 +1542,16 @@ class Cluster(Document):
 		api_token = self.get_password("hetzner_api_token")
 		return Client(token=api_token)
 
+	def _check_frappe_compute_machine_availability(
+		self, machine_type: str | list, instance_id: str | None = None
+	):
+		api_secret = self.get_password("frappe_compute_api_secret")
+
+		client = FrappeComputeClient(
+			url=self.frappe_compute_base_url, api_key=self.frappe_compute_api_key, api_secret=api_secret
+		)
+		return client.check_machine_availability(machine_type, instance_id=instance_id)
+
 	def _check_aws_machine_availability(self, machine_type: str | list) -> bool | dict[str, bool]:
 		"""Check if instance offering in the region is present"""
 		client = self.get_aws_client()
@@ -1156,43 +1584,29 @@ class Cluster(Document):
 			return results
 		return True
 
-	def _check_hetzner_machine_availability(self, machine_type: str | list) -> bool | dict[str, bool]:  # noqa: C901
-		client = self.get_hetzner_client()
-		machine_type_id_map = {}
-		if isinstance(machine_type, list):
-			for m in machine_type:
-				machine = client.server_types.get_by_name(m)
-				if not machine:
-					continue
-				machine_type_id_map[m] = machine.id
-		else:
-			machine = client.server_types.get_by_name(machine_type)
-			if not machine:
-				return False
-			machine_type_id_map[machine_type] = machine.id
+	def _get_hetzner_available_machine_types(self) -> set[str]:
+		cache_key = f"hetzner_available_machine_types:{self.name}"
+		available_machine_types = frappe.cache.get_value(cache_key, expires=True)
+		if available_machine_types is None:
+			available_machine_types = {
+				server_type.name
+				for server_type in self.get_hetzner_client().server_types.get_all()
+				for offering in server_type.locations
+				if offering.location.name == self.region and offering.available
+			}
+			frappe.cache.set_value(cache_key, available_machine_types, expires_in_sec=60 * 60)
+		return available_machine_types
 
-		datacenters = client.datacenters.get_all()
-		datacenters = [dc for dc in datacenters if dc.location.name == self.region]
-		available_machine_ids = []
-		for dc in datacenters:
-			for st in dc.server_types.available:
-				available_machine_ids.append(st.id)
-
-		# For a single machine type, return a boolean to preserve the original behavior.
+	def _check_hetzner_machine_availability(self, machine_type: str | list) -> bool | dict[str, bool]:
+		available_machine_types = self._get_hetzner_available_machine_types()
 		if isinstance(machine_type, str):
-			machine_id = machine_type_id_map[machine_type]
-			return machine_id in available_machine_ids
-
-		# For a list of machine types, return a mapping of name -> availability.
-		results: dict[str, bool] = {}
-		for m in machine_type:
-			# If a machine type was not resolved earlier, treat it as unavailable.
-			machine_id = machine_type_id_map.get(m)
-			results[m] = machine_id in available_machine_ids
-		return results
+			return machine_type in available_machine_types
+		return {m: m in available_machine_types for m in machine_type}
 
 	@frappe.whitelist()
-	def check_machine_availability(self, machine_type: str | list) -> bool | dict[str, bool]:
+	def check_machine_availability(
+		self, machine_type: str | list, instance_id: str | None = None
+	) -> bool | dict[str, bool]:
 		"Check availability of machine in the region before allowing provision"
 		if self.cloud_provider == "AWS EC2":
 			return self._check_aws_machine_availability(machine_type)
@@ -1200,6 +1614,196 @@ class Cluster(Document):
 			return self._check_oci_machine_availability(machine_type)
 		if self.cloud_provider == "Hetzner":
 			return self._check_hetzner_machine_availability(machine_type)
+		if self.cloud_provider == "Frappe Compute":
+			return self._check_frappe_compute_machine_availability(machine_type, instance_id)
+
+		return True
+
+	def get_aws_quota_client(self):
+		return boto3.client(
+			"service-quotas",
+			region_name=self.region,
+			aws_access_key_id=self.aws_access_key_id,
+			aws_secret_access_key=self.get_password("aws_secret_access_key"),
+		)
+
+	def _get_plan_vcpu(self, machine_type: str) -> int:
+		plans = frappe.get_all(
+			"Server Plan",
+			filters={"instance_type": machine_type, "cluster": self.name, "enabled": 1},
+			fields=["vcpu"],
+			limit=1,
+		)
+		if not plans:
+			# Fall back to plans not tied to a specific cluster (e.g. basic/shared plans).
+			plans = frappe.get_all(
+				"Server Plan",
+				filters={"instance_type": machine_type, "enabled": 1},
+				fields=["vcpu"],
+				limit=1,
+			)
+		if not plans:
+			frappe.throw(
+				f"No enabled Server Plan found for instance type {machine_type} in cluster {self.name}.",
+				frappe.ValidationError,
+			)
+		return plans[0].vcpu or 0
+
+	def _get_aws_current_vcpu_usage(self, quota_code: str) -> int:
+		"""Sum vCPUs of non-terminated VMs in this cluster that belong to the given quota bucket."""
+		families = {
+			prefix for prefix, code in self._AWS_INSTANCE_FAMILY_QUOTA_CODES.items() if code == quota_code
+		}
+		if not families:
+			return 0
+		vm = frappe.qb.DocType("Virtual Machine")
+		result = (
+			frappe.qb.from_(vm)
+			.select(Sum(vm.vcpu))
+			.where(vm.cluster == self.name)
+			.where(vm.status != "Terminated")
+			.where(Criterion.any(vm.machine_type.like(f"{prefix}%") for prefix in families))
+		).run()
+		return (result and result[0][0]) or 0
+
+	def _get_quota_code_for_machine_type(self, machine_type: str) -> str:
+		m = re.match(r"^[a-z]+", machine_type.lower())
+		prefix = m.group(0)[0] if m else "t"
+		return self._AWS_INSTANCE_FAMILY_QUOTA_CODES.get(prefix, "L-1216C47A")
+
+	def _get_replaced_vm_quota_info(self, virtual_machine: str | None) -> tuple[str | None, int]:
+		"""Return (quota_code, vcpu_count) for the VM being replaced, or (None, 0)."""
+		if not virtual_machine:
+			return None, 0
+		result = frappe.db.get_value("Virtual Machine", virtual_machine, ["machine_type", "vcpu"])
+		if not result:
+			return None, 0
+		replaced_machine_type, replaced_vcpus = result
+		if not replaced_machine_type:
+			return None, 0
+		return self._get_quota_code_for_machine_type(replaced_machine_type), replaced_vcpus or 0
+
+	def _check_aws_quota(
+		self, machine_type: str | list, virtual_machine: str | None = None
+	) -> bool | dict[str, bool]:
+		"""Check vCPU service quota before provisioning AWS instance(s).
+
+		virtual_machine: name of the VM being replaced (resize). Its vCPUs
+		are subtracted from its own quota bucket only — not from every bucket.
+		"""
+		machine_types = [machine_type] if isinstance(machine_type, str) else machine_type
+		quota_client = self.get_aws_quota_client()
+		replaced_quota_code, replaced_vcpus = self._get_replaced_vm_quota_info(virtual_machine)
+
+		quota_to_types: dict[str, list[str]] = {}
+		for mt in machine_types:
+			quota_to_types.setdefault(self._get_quota_code_for_machine_type(mt), []).append(mt)
+
+		results: dict[str, bool] = {}
+		for quota_code, mts in quota_to_types.items():
+			try:
+				quota_resp = quota_client.get_service_quota(ServiceCode="ec2", QuotaCode=quota_code)
+				limit = int(quota_resp["Quota"]["Value"])
+			except Exception:
+				for mt in mts:
+					results[mt] = True
+				continue
+
+			bucket_replaced = replaced_vcpus if quota_code == replaced_quota_code else 0
+			current_vcpus = self._get_aws_current_vcpu_usage(quota_code) - bucket_replaced
+			for mt in mts:
+				results[mt] = (current_vcpus + self._get_plan_vcpu(mt)) <= limit
+
+		if isinstance(machine_type, str):
+			return results.get(machine_type, True)
+		return results
+
+	def _get_hetzner_current_usage(self) -> tuple[int, int]:
+		"""Return (server_count, vcpu_count) from all non-terminated Hetzner VMs (quota is global)."""
+		vm = frappe.qb.DocType("Virtual Machine")
+		result = (
+			frappe.qb.from_(vm)
+			.select(Count(vm.name), Sum(vm.vcpu))
+			.where(vm.cloud_provider == "Hetzner")
+			.where(vm.status != "Terminated")
+		).run()
+		count, vcpus = result[0] if result else (0, 0)
+		return count or 0, vcpus or 0
+
+	def _check_hetzner_quota(
+		self, machine_type: str | list, virtual_machine: str | None = None
+	) -> bool | dict[str, bool]:
+		"""Check Hetzner quota against limits configured in Press Settings.
+
+		virtual_machine: name of the VM being replaced (resize). When set,
+		server count is unchanged and its vCPUs are subtracted from usage.
+		"""
+		machine_types = [machine_type] if isinstance(machine_type, str) else machine_type
+
+		settings: "PressSettings" = frappe.get_single("Press Settings")
+		vcpu_limit = settings.hetzner_vcpu_limit or 0
+		server_limit = settings.hetzner_server_limit or 0
+
+		if not vcpu_limit and not server_limit:
+			if isinstance(machine_type, list):
+				return {mt: True for mt in machine_type}
+			return True
+
+		current_servers, current_vcpus = self._get_hetzner_current_usage()
+
+		is_resize = bool(virtual_machine)
+		replaced_vcpus = (
+			frappe.db.get_value("Virtual Machine", virtual_machine, "vcpu") or 0 if is_resize else 0
+		)
+		effective_vcpus = current_vcpus - replaced_vcpus
+
+		results: dict[str, bool] = {}
+		for mt in machine_types:
+			vcpus_needed = self._get_plan_vcpu(mt)
+			exceeds_server = not is_resize and server_limit and (current_servers + 1) > server_limit
+			exceeds_vcpu = vcpu_limit and (effective_vcpus + vcpus_needed) > vcpu_limit
+			results[mt] = not exceeds_server and not exceeds_vcpu
+
+		if isinstance(machine_type, str):
+			return results.get(machine_type, True)
+		return results
+
+	def _check_oci_quota(self, machine_type: str | list) -> bool | dict[str, bool]:
+		"""OCI quota is enforced via IAM and the limits service at creation time; always returns available."""
+		if isinstance(machine_type, list):
+			return {mt: True for mt in machine_type}
+		return True
+
+	def _check_frappe_compute_quota(
+		self, machine_type: str | list, instance_id: str | None = None
+	) -> bool | dict[str, bool]:
+		api_secret = self.get_password("frappe_compute_api_secret")
+		client = FrappeComputeClient(
+			url=self.frappe_compute_base_url,
+			api_key=self.frappe_compute_api_key,
+			api_secret=api_secret,
+		)
+		if not hasattr(client, "check_quota"):
+			if isinstance(machine_type, list):
+				return {mt: True for mt in machine_type}
+			return True
+		return client.check_quota(machine_type, instance_id=instance_id)
+
+	def check_quota(
+		self,
+		machine_type: str | list,
+		instance_id: str | None = None,
+		virtual_machine: str | None = None,
+	) -> bool | dict[str, bool]:
+		"Check if sufficient quota exists to provision the machine type in this region"
+		if self.cloud_provider == "AWS EC2":
+			return self._check_aws_quota(machine_type, virtual_machine=virtual_machine)
+		if self.cloud_provider == "OCI":
+			return self._check_oci_quota(machine_type)
+		if self.cloud_provider == "Hetzner":
+			return self._check_hetzner_quota(machine_type, virtual_machine=virtual_machine)
+		if self.cloud_provider == "Frappe Compute":
+			return self._check_frappe_compute_quota(machine_type, instance_id)
 
 		return True
 
@@ -1373,20 +1977,20 @@ class Cluster(Document):
 				port, protocol = rule
 			else:
 				frappe.throw(
-					"Each firewall rule must be [port, protocol], for example: [['22', 'tcp'], ['51820', 'udp']]"
+					"Please provide each firewall rule as [port, protocol], for example: [['22', 'tcp'], ['51820', 'udp']]"
 				)
 
 			normalized_rules.append((port, self._normalize_firewall_protocol(protocol)))
 
 		if not normalized_rules:
-			frappe.throw("At least one firewall rule is required")
+			frappe.throw("Please provide at least one firewall rule.")
 
 		return normalized_rules
 
 	def _normalize_firewall_protocol(self, protocol: str) -> str:
 		protocol = (protocol or "tcp").lower().strip()
 		if protocol not in {"tcp", "udp"}:
-			frappe.throw("Firewall protocol must be one of: tcp, udp")
+			frappe.throw("Please use a supported firewall protocol: tcp or udp.")
 		return protocol
 
 	def _parse_port_range(self, port: str | int) -> tuple[int, int]:
@@ -1409,6 +2013,7 @@ class Cluster(Document):
 		temporary_server: bool = False,
 		kms_key_id: str | None = None,
 		vmi_series: str | None = None,
+		assign_public_ip: bool = True,
 	) -> "VirtualMachine":
 		"""Creates a Virtual Machine for the cluster
 		temporary_server: If you are creating a temporary server for some special purpose, set this to True.
@@ -1429,6 +2034,7 @@ class Cluster(Document):
 				"team": team,
 				"data_disk_snapshot": data_disk_snapshot,
 				"kms_key_id": kms_key_id,
+				"assign_public_ip": assign_public_ip,
 			},
 		).insert()
 
@@ -1472,6 +2078,7 @@ class Cluster(Document):
 		# Accepting only arguments allowed via the API to create a server.
 		# Other arguments can be added laters.
 
+		nat_server = self.get_nat_server_if_supported()
 		team = team or get_current_team()
 		vm = self.create_vm(
 			machine_type=str(plan.instance_type),
@@ -1480,6 +2087,7 @@ class Cluster(Document):
 			domain=frappe.db.get_single_value("Press Settings", "domain"),
 			series=self.unified_server_series,
 			team=team,
+			assign_public_ip=not bool(nat_server),
 		)
 		server, database_server = vm.create_unified_server()
 
@@ -1495,10 +2103,12 @@ class Cluster(Document):
 		server.new_worker_allocation = True
 		server.database_server = database_server.name
 		server.proxy_server = self.proxy_server
+		server.nat_server = nat_server
 
 		# Database configurations
 		database_server.auto_purge_binlog_based_on_size = True
 		database_server.binlog_max_disk_usage_percent = 75 if auto_increase_storage else 20
+		database_server.nat_server = nat_server
 
 		server.save()  # Creating server before database server to use the preset agent password
 		database_server.save()
@@ -1558,11 +2168,17 @@ class Cluster(Document):
 					frappe.ValidationError,
 				)
 
+		nat_server = self.get_nat_server_if_supported()
 		domain = domain or frappe.db.get_single_value("Press Settings", "domain")
 		server_series = {**self.base_servers, **self.private_servers}
 		team = team or get_current_team()
 		plan = plan or self.get_or_create_basic_plan(doctype)
 		assert plan.instance_type is not None, "Instance type is required in the plan"
+		if not self.check_quota(str(plan.instance_type)):
+			frappe.throw(
+				f"Insufficient quota to provision {plan.instance_type} in this region. Please try again after a few hours or reach out at support.frappe.io.",
+				frappe.ValidationError,
+			)
 		vm = self.create_vm(
 			str(plan.instance_type),
 			plan.platform,
@@ -1574,6 +2190,7 @@ class Cluster(Document):
 			temporary_server=temporary_server,
 			kms_key_id=kms_key_id,
 			vmi_series="f" if is_secondary else None,  # Just use `f` series for secondary servers
+			assign_public_ip=not (doctype in ("Server", "Database Server") and nat_server),
 		)
 		server: BaseServer | MonitorServer | LogServer | None = None
 		match doctype:
@@ -1595,6 +2212,7 @@ class Cluster(Document):
 					server.auto_purge_binlog_based_on_size = True
 					server.binlog_max_disk_usage_percent = 20
 
+				server.nat_server = nat_server
 			case "Server":
 				server = vm.create_server(is_secondary=is_secondary, primary=primary)
 				server.title = f"{title} - Application" if not is_secondary else title
@@ -1609,9 +2227,11 @@ class Cluster(Document):
 					)
 				else:
 					server.proxy_server = self.proxy_server
+
 				server.new_worker_allocation = True
 				server.auto_increase_storage = auto_increase_storage
 				server.is_for_recovery = is_for_recovery
+				server.nat_server = nat_server
 			case "Proxy Server":
 				server = vm.create_proxy_server()
 				server.title = f"{title} - Proxy"
@@ -1648,9 +2268,6 @@ class Cluster(Document):
 		cluster_names = unique(frappe.db.get_all("Server", filters={"status": "Active"}, pluck="cluster"))
 		# Temporarily here to skip the Frappe Compute cloud provider
 		filters = {"name": ("in", cluster_names), "public": True}
-
-		if not get_current_team(get_doc=True).is_frappe_compute_internal_user:
-			filters["cloud_provider"] = ("!=", "Frappe Compute")
 
 		return frappe.db.get_all(
 			"Cluster",
@@ -1711,4 +2328,24 @@ class Cluster(Document):
 					best_plan = plan.name
 
 			return best_plan
+		return None
+
+	def get_nat_server_if_supported(self):
+		if self.disable_public_ips_for_servers and self.cloud_provider in (
+			"AWS EC2",
+			"Frappe Compute",
+			"Hetzner",
+			"DigitalOcean",
+			"OCI",
+		):
+			nat_server = frappe.db.get_value(
+				"NAT Server",
+				{"status": "Active", "cluster": self.name, "secondary_private_ip": ("is", "set")},
+				"name",
+			)
+			if not nat_server:
+				nat_server = frappe.db.get_value(
+					"NAT Server", {"status": "Active", "cluster": self.name}, "name"
+				)
+			return nat_server
 		return None

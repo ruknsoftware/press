@@ -3,6 +3,9 @@
 
 import frappe
 from frappe.model.document import Document
+from frappe.query_builder.functions import Count
+
+from press.utils import get_current_team
 
 
 class PartnerAudit(Document):
@@ -49,9 +52,12 @@ class PartnerAudit(Document):
 	def get_list_query(query, filters=None, **list_args):
 		PartnerAudit = frappe.qb.DocType("Partner Audit")
 		Team = frappe.qb.DocType("Team")
+		NonConformance = frappe.qb.DocType("Partner Non Conformance")
 
 		query = (
 			frappe.qb.from_(PartnerAudit)
+			.left_join(NonConformance)
+			.on(NonConformance.partner_audit == PartnerAudit.name)
 			.inner_join(Team)
 			.on(PartnerAudit.partner_team == Team.name)
 			.select(
@@ -62,12 +68,26 @@ class PartnerAudit(Document):
 				PartnerAudit.conducted_by,
 				PartnerAudit.proposed_audit_date,
 				PartnerAudit.name,
+				Count(NonConformance.name).as_("non_conformance_count"),
 			)
+			.groupby(PartnerAudit.name)
 			.limit(list_args["limit"])
 			.offset(list_args["start"])
 			.orderby(PartnerAudit.modified, order=frappe.qb.desc)
 		)
-		if filters.get("team"):
+
+		# This query is built from scratch, so the scoping `press.api.client`
+		# applied to the query it handed over is gone. Reapply it. A partner
+		# picking their own team in `filters` is redundant but harmless.
+		if not frappe.local.system_user():
+			query = query.where(PartnerAudit.partner_team == get_current_team())
+		elif filters.get("team"):
 			query = query.where(PartnerAudit.partner_team == filters["team"])
+		if filters.get("status") and filters["status"] != "All":
+			query = query.where(PartnerAudit.status == filters["status"])
+		if filters.get("mode_of_audit") and filters["mode_of_audit"] != "All":
+			query = query.where(PartnerAudit.mode_of_audit == filters["mode_of_audit"])
+		if filters.get("proposed_audit_date"):
+			query = query.where(PartnerAudit.proposed_audit_date == filters["proposed_audit_date"])
 
 		return query.run(as_dict=True)

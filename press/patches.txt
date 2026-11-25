@@ -82,7 +82,6 @@ press.press.doctype.team.patches.set_payment_mode
 press.patches.v0_0_1.add_team_name_as_default_notify_email
 press.press.doctype.team.patches.set_referrer_id
 press.press.doctype.team.patches.set_partner_email
-press.press.doctype.proxy_server.patches.generate_proxysql_monitor_password
 press.press.doctype.virtual_machine.patches.populate_volumes_table
 press.press.doctype.release_group.patches.set_bench_dependency_in_release_group
 press.press.doctype.press_settings.patches.move_stripe_credentials_to_press_settings
@@ -111,6 +110,8 @@ press.press.doctype.virtual_machine_volume.patches.rename_aws_fields
 press.patches.v0_7_0.convert_marketplace_description_to_html
 press.press.doctype.team.patches.remove_invalid_email_addresses
 press.saas.doctype.product_trial.patches.rename_saas_product_doctypes_to_product_trial
+press.patches.v0_8_0.encrypt_tls_private_keys_at_rest
+press.patches.v0_8_0.rename_support_roles
 
 [post_model_sync]
 press.patches.v0_7_0.rename_plan_to_site_plan
@@ -150,13 +151,33 @@ press.press.doctype.user_2fa.patches.generate_recovery_codes
 press.press.doctype.account_request.patches.generate_expiration_time_for_request_key
 press.saas.doctype.product_trial_request.patches.set_subscription_created_flag
 press.patches.v0_8_0.move_notify_billing_email_of_team_to_child_doc
-press.patches.v0_8_0.clear_alertmanager_webhook_log
 press.patches.v0_8_0.reset_release_group_gunicorn_workers
+press.patches.v0_8_0.clear_alertmanager_webhook_log
 press.press.doctype.press_role.patches.to_resources
 press.press.doctype.server.patches.set_is_provisioning_press_job_completed
 press.patches.v0_8_0.add_cloud_providers_to_site_plans
 press.patches.v0_8_0.update_tmpdir_for_data_volume_dbs
+press.press.doctype.proxy_server.patches.set_use_as_proxy_for_agent_and_metrics_for_proxy_servers
 press.patches.v0_0_1.cancel_pending_version_upgrades_for_disabled_bench_groups
 press.partner.doctype.partner_lead.patches.merge_engagement_stage_to_status
-press.press.doctype.proxy_server.patches.set_use_as_proxy_for_agent_and_metrics_for_proxy_servers
 press.patches.v0_0_1.add_job_status_index_press_job_step
+press.patches.v0_8_0.set_suspended_at_for_suspended_sites
+press.marketplace.patches.cleanup_code_screening_data
+press.patches.v0_8_0.merge_press_admin_member_roles
+press.patches.v0_8_0.team_member_default_role
+press.patches.v0_8_0.add_app_source_to_app_audit
+press.patches.v0_8_0.bump_v16_bench_version_to_5_31_0
+press.patches.v0_8_0.bump_v15_bench_version_to_5_31_0
+press.patches.v0_8_0.add_disk_full_alert_rule
+press.patches.v0_8_0.unset_rate_limit_for_dedicated_server_sites #2026-11-23
+press.patches.v0_8_0.backfill_site_version_audits
+press.patches.v0_8_0.set_reference_on_press_notifications
+press.patches.v0_8_0.encrypt_telegram_bot_tokens
+press.patches.v0_8_0.encrypt_mailgun_api_key
+press.patches.v0_8_0.fix_dashboard_banner_help_urls
+press.patches.v0_8_0.set_cluster_backup_bucket
+press.patches.v0_8_0.remove_custom_docperms_of_press_doctypes
+press.patches.v0_8_0.set_missing_cluster_backup_buckets
+press.patches.v0_8_0.set_cluster_mariadb_monitor_password
+# run by hand after deploy, with the execute command
+# press.patches.v0_8_0.bump_v16_nightly_node_version_to_24_22_1

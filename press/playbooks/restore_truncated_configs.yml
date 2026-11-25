@@ -1,0 +1,10 @@
+---
+- name: Restore Truncated Configs
+  hosts: all
+  become: yes
+  become_user: root
+  # Facts need SSH, and after a reboot the server is down when the play starts.
+  # The role waits for it, and it uses no facts.
+  gather_facts: no
+  roles:
+    - role: restore_truncated_configs

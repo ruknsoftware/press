@@ -3,11 +3,28 @@
 
 frappe.ui.form.on('NAT Server', {
 	refresh(frm) {
-		[
+		press.add_console_button(frm)
+		;[
 			[__('Prepare Server'), 'prepare_server', true, !frm.doc.is_server_setup],
 			[__('Setup Server'), 'setup_server', true, !frm.doc.is_server_setup],
+			[__('Ping Ansible'), 'ping_ansible', true, frm.doc.is_server_setup],
 			[__('Archive Server'), 'archive', true, frm.doc.is_server_setup],
 			[__('Get Static IP'), 'get_static_ip', true, !frm.doc.is_static_ip],
+			[__('Attach NAT Security Group'), 'attach_nat_security_group', true],
+			[
+				__('Install Wazuh Agent'),
+				'install_wazuh_agent',
+				true,
+				frm.doc.is_server_setup,
+			],
+			[
+				__('Uninstall Wazuh Agent'),
+				'uninstall_wazuh_agent',
+				true,
+				frm.doc.is_server_setup && frm.doc.is_wazuh_agent_installed,
+			],
+			[__('Setup Fail2ban'), 'setup_fail2ban', true, frm.doc.is_server_setup],
+			[__('Remove Fail2ban'), 'remove_fail2ban', true, frm.doc.is_server_setup],
 		].forEach(([label, method, confirm, condition]) => {
 			if (typeof condition === 'undefined' || condition) {
 				frm.add_custom_button(
@@ -19,26 +36,26 @@ frappe.ui.form.on('NAT Server', {
 								() =>
 									frm.call(method).then((r) => {
 										if (r.message) {
-											frappe.msgprint(r.message);
+											frappe.msgprint(r.message)
 										} else {
-											frm.refresh();
+											frm.refresh()
 										}
 									}),
-							);
+							)
 						} else {
 							frm.call(method).then((r) => {
 								if (r.message) {
-									frappe.msgprint(r.message);
+									frappe.msgprint(r.message)
 								} else {
-									frm.refresh();
+									frm.refresh()
 								}
-							});
+							})
 						}
 					},
 					__('Actions'),
-				);
+				)
 			}
-		});
+		})
 
 		if (frm.doc.status === 'Active' && !!frm.doc.secondary_private_ip) {
 			frm.add_custom_button(
@@ -61,7 +78,7 @@ frappe.ui.form.on('NAT Server', {
 											cluster: frm.doc.cluster,
 											secondary_private_ip: ['is', 'not set'],
 										},
-									};
+									}
 								},
 							},
 						],
@@ -77,15 +94,15 @@ frappe.ui.form.on('NAT Server', {
 								})
 								.then((r) => {
 									if (r.message) {
-										frappe.msgprint(r.message);
+										frappe.msgprint(r.message)
 									}
-								});
-							d.hide();
+								})
+							d.hide()
 						},
-					}).show();
+					}).show()
 				},
 				__('Actions'),
-			);
+			)
 		}
 	},
-});
+})

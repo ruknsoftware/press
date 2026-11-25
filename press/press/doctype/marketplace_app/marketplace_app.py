@@ -15,22 +15,28 @@ from frappe.utils.safe_exec import safe_exec
 from frappe.website.utils import cleanup_page_name
 from frappe.website.website_generator import WebsiteGenerator
 
+from press.access.staff_roles import needs_staff_role, safe_for_readers
 from press.api.client import dashboard_whitelist
-from press.api.github import app, get_access_token
+from press.api.github import get_access_token, get_app_info
 from press.marketplace.doctype.marketplace_app_plan.marketplace_app_plan import (
 	get_app_plan_features,
 )
+from press.overrides import get_permission_query_conditions_for_doctype
 from press.press.doctype.app.app import VersioningError, parse_frappe_version
 from press.press.doctype.app.app import new_app as new_app_doc
 from press.press.doctype.app_release_approval_request.app_release_approval_request import (
 	AppReleaseApprovalRequest,
 )
+from press.press.doctype.github_installation.github_installation import validate_team_can_use_installation
 from press.press.doctype.marketplace_app.utils import get_rating_percentage_distribution
-from press.utils import get_current_team, get_last_doc
+from press.utils import docs, get_current_team, get_last_doc
 
 if TYPE_CHECKING:
 	from press.press.doctype.app_source.app_source import AppSource
 	from press.press.doctype.site.site import Site
+
+
+get_permission_query_conditions = get_permission_query_conditions_for_doctype("Marketplace App")
 
 
 class MarketplaceApp(WebsiteGenerator):
@@ -74,15 +80,6 @@ class MarketplaceApp(WebsiteGenerator):
 		privacy_policy: DF.Data | None
 		published: DF.Check
 		published_on: DF.Date | None
-		review_stage: DF.Literal[
-			"Not Started",
-			"Description Missing",
-			"Logo Missing",
-			"App Release Not Reviewed",
-			"Ready for Review",
-			"Ready to Publish",
-			"Rejected",
-		]
 		route: DF.Data | None
 		run_after_install_script: DF.Check
 		run_after_uninstall_script: DF.Check
@@ -92,7 +89,6 @@ class MarketplaceApp(WebsiteGenerator):
 		site_config: DF.JSON | None
 		sources: DF.Table[MarketplaceAppVersion]
 		status: DF.Literal["Draft", "Published", "In Review", "Attention Required", "Rejected", "Disabled"]
-		stop_auto_review: DF.Check
 		subject: DF.Data | None
 		subscription_type: DF.Literal["Free", "Paid", "Freemium"]
 		subscription_update_hook: DF.Data | None
@@ -108,19 +104,33 @@ class MarketplaceApp(WebsiteGenerator):
 		"title",
 		"status",
 		"description",
-		"review_stage",
+	]
+
+	dashboard_insert_fields: ClassVar = [
+		"name",
+		"title",
+		"repository_url",
+		"github_installation_id",
+		"branch",
+		"is_public",
+		"frappe_version",
 	]
 
 	def autoname(self):
 		self.name = self.app
 
 	@dashboard_whitelist()
+	@needs_staff_role("Press Marketplace Manager")
 	def delete(self):
 		if self.status != "Draft":
-			frappe.throw("You can only delete an app in Draft status")
+			frappe.throw(
+				f"Only apps in Draft status can be deleted. Published apps must be unpublished first — please contact support to take this app down. {docs.doc_link(docs.MARKETPLACE)}."
+			)
 
 		if get_current_team() != self.team:
-			frappe.throw("You are not authorized to delete this app")
+			frappe.throw(
+				"Only the team that owns this app can delete it. Please switch to the owning team and try again."
+			)
 
 		super().delete()
 
@@ -131,11 +141,13 @@ class MarketplaceApp(WebsiteGenerator):
 		frappe.db.delete("Marketplace App Audit", {"marketplace_app": self.name})
 
 	@dashboard_whitelist()
+	@needs_staff_role("Press Marketplace Manager")
 	def create_approval_request(self, app_release: str):
 		"""Create a new Approval Request for given `app_release`"""
 		AppReleaseApprovalRequest.create(self.app, app_release)
 
 	@dashboard_whitelist()
+	@needs_staff_role("Press Marketplace Manager")
 	def cancel_approval_request(self, app_release: str):
 		approval_requests = frappe.get_all(
 			"App Release Approval Request",
@@ -145,11 +157,14 @@ class MarketplaceApp(WebsiteGenerator):
 		)
 
 		if len(approval_requests) == 0:
-			frappe.throw("No approval request exists for the given app release")
+			frappe.throw(
+				"There's no review request to cancel for this app release. It may have already been cancelled or processed."
+			)
 
 		frappe.get_doc("App Release Approval Request", approval_requests[0]).cancel()
 
 	@dashboard_whitelist()
+	@needs_staff_role("Press Marketplace Manager")
 	def yank_app_release(self, app_release: str, hash: str):
 		"""Yank app release, this commit hash won't show for any new updates even if in approved state"""
 		team = get_current_team()
@@ -163,11 +178,13 @@ class MarketplaceApp(WebsiteGenerator):
 		).insert()
 
 	@dashboard_whitelist()
+	@needs_staff_role("Press Marketplace Manager")
 	def unyank_app_release(self, hash: str):
 		"""Allow support for unyanking app release (https://peps.pythondiscord.com/pep-0592/)"""
 		frappe.get_doc("Yanked App Release", {"hash": hash}).delete()
 
 	def before_insert(self):
+		self.validate_github_installations()
 		if not frappe.flags.in_test:
 			self.check_if_duplicate()
 			self.create_app_and_source_if_needed()
@@ -182,6 +199,19 @@ class MarketplaceApp(WebsiteGenerator):
 		if frappe.db.exists("Marketplace App", self.name):
 			frappe.throw(f"App {self.name} already exists. Please contact support.")
 
+	def validate_github_installations(self):
+		"""Check the installation passed in and those of sources new to this team."""
+		for installation in {self.get("github_installation_id"), *self.get_new_source_installations()}:
+			validate_team_can_use_installation(self.team, installation)
+
+	def get_new_source_installations(self) -> list[str]:
+		before = self.get_doc_before_save()
+		known = {row.source for row in before.sources} if before and before.team == self.team else set()
+		names = [row.source for row in self.sources if row.source not in known]
+		if not names:
+			return []
+		return frappe.get_all("App Source", {"name": ("in", names)}, pluck="github_installation_id")
+
 	def create_app_and_source_if_needed(self):
 		if frappe.db.exists("App", self.app or self.name):
 			app_doc = frappe.get_doc("App", self.app or self.name)
@@ -190,11 +220,11 @@ class MarketplaceApp(WebsiteGenerator):
 
 		if not self.sources:
 			source = app_doc.add_source(
-				self.version,
-				self.repository_url,
-				self.branch,
-				self.team,
-				self.github_installation_id,
+				repository_url=self.repository_url,
+				branch=self.branch,
+				team=self.team,
+				github_installation_id=self.github_installation_id,
+				frappe_version=self.frappe_version,
 				public=getattr(self, "is_public", True),
 			)
 			self.app = source.app
@@ -208,12 +238,16 @@ class MarketplaceApp(WebsiteGenerator):
 
 		self.published = self.status == "Published"
 		self.validate_sources()
+		if not self.is_new():
+			self.validate_github_installations()
 		self.validate_number_of_screenshots()
 		self.validate_summary()
 
 	def validate_summary(self):
 		if len(self.description) > 140:
-			frappe.throw("Marketplace App summary cannot be more than 140 characters.")
+			frappe.throw(
+				f"The app summary is {len(self.description)} characters. Please shorten it to 140 characters or fewer."
+			)
 
 	def validate_sources(self):
 		for source in self.sources:
@@ -309,6 +343,7 @@ class MarketplaceApp(WebsiteGenerator):
 				branch=to_branch,
 				version=version,
 				github_installation_id=source_doc.github_installation_id,
+				ease_versioning_constrains=True,
 			)
 			if version not in [version.version for version in source_doc.versions]:
 				source_doc.append("versions", {"version": version})
@@ -325,6 +360,7 @@ class MarketplaceApp(WebsiteGenerator):
 				branch=to_branch,
 				version=version,
 				github_installation_id=source_doc.github_installation_id,
+				ease_versioning_constrains=True,
 			)
 			source_doc.branch = to_branch
 			source_doc.save()
@@ -342,7 +378,8 @@ class MarketplaceApp(WebsiteGenerator):
 		self.save()
 
 	@dashboard_whitelist()
-	def add_version(self, version, branch):
+	@needs_staff_role("Press Marketplace Manager")
+	def add_version(self, version: str, repo_owner: str, repo_name: str, branch: str):
 		existing_source = frappe.db.exists(
 			"App Source",
 			[
@@ -350,20 +387,37 @@ class MarketplaceApp(WebsiteGenerator):
 				["App Source", "team", "=", self.team],
 				["App Source", "branch", "=", branch],
 				["App Source", "enabled", "=", 1],
+				["App Source", "repository", "=", repo_name],
+				["App Source", "repository_owner", "=", repo_owner],
 			],
 		)
-		source_doc: "AppSource" = (
-			frappe.get_doc("App Source", existing_source)
-			if existing_source
-			else frappe.get_doc("App Source", self.sources[0].source)
+		# When the branch isn't an existing source yet, copy connection details from any source the
+		# team already has for the same repository — the same sources that populate the dashboard's
+		# branch dropdown. We can't rely on self.sources, which may be empty (e.g. all versions of a
+		# draft app were removed) even though App Source records still exist.
+		template_source = existing_source or frappe.db.exists(
+			"App Source",
+			{
+				"app": self.app,
+				"team": self.team,
+				"repository": repo_name,
+				"repository_owner": repo_owner,
+				"enabled": 1,
+			},
 		)
+		if not template_source:
+			frappe.throw(
+				_("No app source found for {0}/{1} to add a version from.").format(repo_owner, repo_name)
+			)
+		source_doc: "AppSource" = frappe.get_doc("App Source", template_source)
 		validate_frappe_version_for_branch(
 			app_name=self.app,
-			owner=source_doc.repository_owner,
-			repository=source_doc.repository,
+			owner=repo_owner,
+			repository=repo_name,
 			branch=branch,
 			version=version,
 			github_installation_id=source_doc.github_installation_id,
+			ease_versioning_constrains=True,
 		)
 		if existing_source:
 			# If source with branch to switch already exists, just add version to child table of source and use the same
@@ -383,9 +437,7 @@ class MarketplaceApp(WebsiteGenerator):
 					"app": self.app,
 					"team": self.team,
 					"branch": branch,
-					"repository_url": frappe.db.get_value(
-						"App Source", {"name": self.sources[0].source}, "repository_url"
-					),
+					"repository_url": source_doc.repository_url,
 					"public": 1,
 				}
 			)
@@ -396,7 +448,8 @@ class MarketplaceApp(WebsiteGenerator):
 		self.save()
 
 	@dashboard_whitelist()
-	def remove_version(self, version):
+	@needs_staff_role("Press Marketplace Manager")
+	def remove_version(self, version: str):
 		if self.status == "Published" and len(self.sources) == 1:
 			frappe.throw("Failed to remove. Need at least 1 version for a published app")
 
@@ -661,6 +714,7 @@ class MarketplaceApp(WebsiteGenerator):
 		return result[0] if result else {"usd_amount": 0, "inr_amount": 0}
 
 	@dashboard_whitelist()
+	@safe_for_readers
 	def site_installs(self):
 		site = frappe.qb.DocType("Site")
 		site_app = frappe.qb.DocType("Site App")
@@ -681,6 +735,7 @@ class MarketplaceApp(WebsiteGenerator):
 		return query.run(as_dict=True)
 
 	@dashboard_whitelist()
+	@safe_for_readers
 	def listing_details(self):
 		return {
 			"support": self.support,
@@ -694,12 +749,14 @@ class MarketplaceApp(WebsiteGenerator):
 		}
 
 	@dashboard_whitelist()
+	@needs_staff_role("Press Marketplace Manager")
 	def mark_app_ready_for_review(self):
 		# TODO: Start security check and auto deploy process here
-		self.review_stage = "Ready for Review"
+		self.status = "In Review"
 		self.save()
 
 	@dashboard_whitelist()
+	@needs_staff_role("Press Marketplace Manager")
 	def update_listing(self, *args):
 		data = frappe._dict(args[0])
 		self.title = data.get("title") or self.title
@@ -770,17 +827,25 @@ def validate_frappe_version_for_branch(
 	"""Check if the version being added is supported by the branch comparing the frappe versions in pyproject.toml
 	Only check for lower bounds major version compatibility in case `ease_versioning_constrains` is set to True
 	"""
-	app_info = app(
+	app_info = get_app_info(
 		owner=owner,
 		repository=repository,
 		branch=branch,
 		installation=github_installation_id
 		if github_installation_id
 		else frappe.get_value("Press Settings", None, "github_access_token"),
+		app_name=app_name,
 	)
 	frappe_version = app_info.get("frappe_version")
-	frappe_version = parse_frappe_version(frappe_version, app_info.get("title"), ease_versioning_constrains)
-	if version not in frappe_version:
+	if frappe_version is None:
+		# The framework doesn't declare a supported range of itself. Its branches are
+		# checked against the bench version in ReleaseGroup.change_app_branch instead.
+		return
+
+	supported_versions = parse_frappe_version(
+		frappe_version, app_info.get("title"), ease_versioning_constrains
+	)
+	if version not in supported_versions:
 		frappe.throw(f"{version} is not supported by branch {branch} for app {app_name}", VersioningError)
 
 
@@ -828,7 +893,7 @@ def marketplace_app_hook(app=None, site: Site | None = None, op="install"):
 		for app_name in site_apps:
 			run_script(app_name, site, op)
 	else:
-		run_script(app, site, op)
+		run_script(app, site, op)  # type: ignore[arg-type]
 
 
 def get_script_name(app, op):

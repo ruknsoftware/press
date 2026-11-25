@@ -11,6 +11,13 @@
 		 otherwise user will only go through just the initial step to change plan  -->
 
 			<div v-if="step === 'site-plans'">
+				<div
+					v-if="lastPlanChangedOn"
+					class="mb-4 flex items-center gap-2 rounded bg-surface-gray-1 p-2 text-p-base text-ink-gray-7"
+				>
+					<lucide-history class="h-4 w-4 text-ink-gray-6" />
+					<span>Plan last changed on {{ lastPlanChangedOn }}</span>
+				</div>
 				<!-- doing this weird thing because progress with intervals doesn't rerender on moving to new step for some reason -->
 				<!-- TODO: fix it in frappe-ui -->
 				<Progress
@@ -28,11 +35,17 @@
 					:isDedicatedServerSite="$site.doc.is_dedicated_server"
 					:selectedProvider="$site.doc.server_provider"
 				/>
-				<div class="mt-4 text-xs text-gray-700">
+				<AlertBanner
+					v-if="showDowngradeLockNotice"
+					class="mt-4"
+					type="warning"
+					title="Plans priced $50/mo or above can't be downgraded for 30 days from the date of upgrade."
+				/>
+				<div class="mt-4 text-xs text-ink-gray-7">
 					<div
-						class="flex items-center rounded bg-gray-50 p-2 text-p-base font-medium text-gray-800"
+						class="flex items-center rounded bg-surface-gray-1 p-2 text-p-base font-medium text-ink-gray-8"
 					>
-						<lucide-badge-check class="mr-2 h-5 w-12 text-gray-600" />
+						<lucide-badge-check class="mr-2 h-5 w-12 text-ink-gray-6" />
 						<span>
 							<strong>Support</strong> covers only issues of Frappe apps and not
 							functional queries. You can raise a support ticket for Frappe
@@ -52,7 +65,7 @@
 					:intervals="true"
 					:value="65"
 				/>
-				<div class="mb-5 inline-flex gap-1.5 text-base text-gray-700">
+				<div class="mb-5 inline-flex gap-1.5 text-base text-ink-gray-7">
 					<FeatherIcon class="h-4" name="info" />
 					<span> Add billing details to your account before proceeding.</span>
 				</div>
@@ -73,12 +86,12 @@
 					:value="99"
 				/>
 				<div
-					class="mb-5 flex w-full flex-row gap-2 rounded-md border p-1 text-p-base text-gray-800"
+					class="mb-5 flex w-full flex-row gap-2 rounded-md border p-1 text-p-base text-ink-gray-8"
 				>
 					<div
 						class="w-1/2 cursor-pointer rounded-[7px] py-1.5 text-center transition-all"
 						:class="{
-							'bg-gray-100': isAutomatedBilling,
+							'bg-surface-gray-2': isAutomatedBilling,
 						}"
 						@click="isAutomatedBilling = true"
 					>
@@ -87,7 +100,7 @@
 					<div
 						class="w-1/2 cursor-pointer rounded-sm py-1.5 text-center transition-all"
 						:class="{
-							'bg-gray-100': !isAutomatedBilling,
+							'bg-surface-gray-2': !isAutomatedBilling,
 						}"
 						@click="isAutomatedBilling = false"
 					>
@@ -98,7 +111,7 @@
 				<div>
 					<div
 						v-if="isAutomatedBilling"
-						class="mb-5 flex items-center gap-2 text-sm text-gray-700"
+						class="mb-5 flex items-center gap-2 text-sm text-ink-gray-7"
 					>
 						<FeatherIcon class="h-4" name="info" />
 						<span>
@@ -108,7 +121,7 @@
 					</div>
 					<div
 						v-else
-						class="mb-5 flex items-center gap-2 text-sm text-gray-700"
+						class="mb-5 flex items-center gap-2 text-sm text-ink-gray-7"
 					>
 						<FeatherIcon class="h-4" name="info" />
 						<span>
@@ -150,9 +163,14 @@
 import { getCachedDocumentResource, createResource, Progress } from 'frappe-ui';
 import SitePlansCards from './SitePlansCards.vue';
 import { getPlans, getPlan } from '../data/plans';
+import { date } from '../utils/format';
 import CardForm from './billing/CardForm.vue';
 import BillingDetails from './billing/BillingDetails.vue';
 import PrepaidCreditsForm from './billing/PrepaidCreditsForm.vue';
+import AlertBanner from './AlertBanner.vue';
+
+// Plans priced at or above this (USD/mo) are locked from downgrading for 30 days.
+const DOWNGRADE_LOCK_PRICE_USD = 50;
 
 export default {
 	name: 'ManageSitePlansDialog',
@@ -162,6 +180,7 @@ export default {
 		SitePlansCards,
 		BillingDetails,
 		PrepaidCreditsForm,
+		AlertBanner,
 	},
 	props: {
 		site: {
@@ -181,6 +200,19 @@ export default {
 				url: 'press.api.billing.change_payment_mode',
 			}),
 		};
+	},
+	resources: {
+		planChange() {
+			return {
+				url: 'press.api.client.run_doc_method',
+				makeParams: () => ({
+					dt: 'Site',
+					dn: this.site,
+					method: 'last_plan_change',
+				}),
+				auto: true,
+			};
+		},
 	},
 	watch: {
 		site: {
@@ -275,6 +307,28 @@ export default {
 	computed: {
 		$site() {
 			return getCachedDocumentResource('Site', this.site);
+		},
+		showDowngradeLockNotice() {
+			// Warn when upgrading to a $50/mo-or-above plan (locked from downgrade for 30 days).
+			const selectedPrice = this.plan?.price_usd || 0;
+			const currentPrice = this.$site?.doc?.current_plan?.price_usd || 0;
+			return (
+				selectedPrice >= DOWNGRADE_LOCK_PRICE_USD && selectedPrice > currentPrice
+			);
+		},
+		lastPlanChange() {
+			const change = this.$resources.planChange?.data?.message || null;
+			// A site gets its first plan through a plan change record as well, and
+			// that record is an assignment rather than a change.
+			if (!change || change.type === 'Initial Plan' || !change.from_plan) {
+				return null;
+			}
+			return change;
+		},
+		lastPlanChangedOn() {
+			return this.lastPlanChange
+				? date(this.lastPlanChange.creation, 'lll')
+				: null;
 		},
 		showSetupSubscription() {
 			return (

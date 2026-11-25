@@ -1,16 +1,16 @@
 import frappe
+from frappe.query_builder.functions import Count
 
-from press.guards import role_guard
-from press.guards.role_guard.document import has_user_permission
+from press.guards.role_guard.notification import restrict_to_roles
+from press.press.doctype.press_notification.press_notification import resource_route
 from press.utils import get_current_team
 
 
 @frappe.whitelist()
 def get_notifications(
-	filters=None,
-	order_by="creation desc",
-	limit_start=None,
-	limit_page_length=None,
+	filters: dict | None = None,
+	limit_start: int = 0,
+	limit_page_length: int = 20,
 ):
 	if not filters:
 		filters = {}
@@ -29,6 +29,9 @@ def get_notifications(
 			PressNotification.is_actionable,
 			PressNotification.document_type,
 			PressNotification.document_name,
+			PressNotification.reference_doctype,
+			PressNotification.reference_name,
+			PressNotification["class"],
 		)
 		.where(PressNotification.team == get_current_team())
 		.orderby(PressNotification.creation, order=frappe.qb.desc)
@@ -36,47 +39,61 @@ def get_notifications(
 		.offset(limit_start)
 	)
 
-	if role_guard.is_restricted():
-		if not has_user_permission("Site"):
-			pemitted_sites = role_guard.permitted_documents("Site")
-			if not pemitted_sites:
-				query = query.where(PressNotification.document_type != "Site")
-			else:
-				query = query.where(PressNotification.document_name.isin(pemitted_sites))
-		if not has_user_permission("Release Group"):
-			permitted_release_groups = role_guard.permitted_documents("Release Group")
-			if not permitted_release_groups:
-				query = query.where(PressNotification.document_type != "Release Group")
-			else:
-				query = query.where(PressNotification.document_name.isin(permitted_release_groups))
-
 	if filters.get("read") == "Unread":
 		query = query.where(PressNotification.read == 0)
 
-	notifications = query.run(as_dict=True)
+	if filters.get("type"):
+		query = query.where(PressNotification.type == filters["type"])
+
+	notifications = restrict_to_roles(query).run(as_dict=True)
 
 	for notification in notifications:
-		if notification.document_type == "Deploy Candidate":
-			rg_name = frappe.db.get_value("Deploy Candidate", notification.document_name, "group")
-			notification.route = f"groups/{rg_name}/deploys/{notification.document_name}"
-		elif notification.document_type == "Agent Job":
-			site_name = frappe.db.get_value("Agent Job", notification.document_name, "site")
-			notification.route = (
-				f"sites/{site_name}/insights/jobs/{notification.document_name}" if site_name else None
-			)
-		elif notification.document_type == "Support Access":
-			notification.route = "access-requests"
-		else:
-			notification.route = None
+		assign_notification_route(notification)
 
 	return notifications
 
 
+def assign_notification_route(notification):
+	if notification.document_type == "Deploy Candidate Build":
+		rg_name = frappe.db.get_value("Deploy Candidate Build", notification.document_name, "group")
+		notification.route = f"groups/{rg_name}/deploys/{notification.document_name}"
+	elif notification.document_type == "Agent Job":
+		site_name = frappe.db.get_value("Agent Job", notification.document_name, "site")
+		notification.route = (
+			f"sites/{site_name}/insights/jobs/{notification.document_name}" if site_name else None
+		)
+	elif notification.document_type == "Support Access":
+		notification.route = "access-requests"
+	elif notification.document_type == "Malware Scan":
+		notification.route = f"servers/{notification.reference_name}/security"
+	elif notification.type == "Resource Access":
+		notification.route = resource_route(notification)
+	else:
+		notification.route = None
+
+
 @frappe.whitelist()
 def mark_all_notifications_as_read():
-	frappe.db.set_value("Press Notification", {"team": get_current_team()}, "read", 1, update_modified=False)
+	PressNotification = frappe.qb.DocType("Press Notification")
+	query = (
+		frappe.qb.update(PressNotification)
+		.set(PressNotification.read, 1)
+		.where(PressNotification.team == get_current_team())
+	)
+	restrict_to_roles(query).run()
 
 
 @frappe.whitelist()
-def get_unread_count():
-	return frappe.db.count("Press Notification", {"read": False, "team": get_current_team()})
+def get_unread_count(type: str | None = None):
+	PressNotification = frappe.qb.DocType("Press Notification")
+	query = (
+		frappe.qb.from_(PressNotification)
+		.select(Count(PressNotification.name))
+		.where(PressNotification.team == get_current_team())
+		.where(PressNotification.read == 0)
+	)
+
+	if type:
+		query = query.where(PressNotification.type == type)
+
+	return restrict_to_roles(query).run(pluck=True)[0]

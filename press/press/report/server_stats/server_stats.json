@@ -32,7 +32,7 @@
  ],
  "idx": 0,
  "is_standard": "Yes",
- "modified": "2023-05-17 18:33:39.554734",
+ "modified": "2026-11-06 12:30:00.000000",
  "modified_by": "Administrator",
  "module": "Press",
  "name": "Server Stats",
@@ -46,10 +46,13 @@
    "role": "System Manager"
   },
   {
-   "role": "Press Member"
+   "role": "Press User"
   },
   {
-   "role": "Press Admin"
+   "role": "Press User"
+  },
+  {
+   "role": "Press Infrastructure Manager"
   }
  ]
 }

@@ -34,6 +34,7 @@ from press.press.doctype.incident.incident import (
 	CALL_REPEAT_INTERVAL_NIGHT,
 	CALL_THRESHOLD_SECONDS_NIGHT,
 	CONFIRMATION_THRESHOLD_SECONDS_NIGHT,
+	MAX_ASSIGNED_CALLS_BEFORE_DEFAULT_AT_NIGHT,
 	MIN_FIRING_INSTANCES,
 	MIN_FIRING_INSTANCES_FRACTION,
 	Incident,
@@ -46,7 +47,6 @@ from press.press.doctype.prometheus_alert_rule.test_prometheus_alert_rule import
 )
 from press.press.doctype.site.test_site import create_test_site
 from press.press.doctype.team.test_team import create_test_press_admin_team
-from press.press.doctype.telegram_message.telegram_message import TelegramMessage
 from press.utils.test import foreground_enqueue_doc
 
 if typing.TYPE_CHECKING:
@@ -147,6 +147,9 @@ def get_total_firing_and_resolved_for_resolved_incident(draw) -> tuple[int, int,
 @patch("tenacity.nap.time", new=Mock())  # no sleep
 @patch.object(Incident, "sites_down", new=[])
 @patch.object(Incident, "down_bench", new=[])
+@patch.object(
+	Incident, "monitor_server", Mock(get_sites_down_for_server=Mock(return_value=["test-site.frappe.cloud"]))
+)
 class TestIncident(FrappeTestCase):
 	def setUp(self):
 		super().setUp()
@@ -370,39 +373,49 @@ class TestIncident(FrappeTestCase):
 		incident.reload()
 		self.assertEqual(incident.status, "Auto-Resolved")
 
-	@given(get_total_and_firing_for_ongoing_incident())
-	@settings(max_examples=20, deadline=timedelta(seconds=5))
-	def test_is_enough_firing_is_true_for_ongoing_incident(self, total_firing):
+	def test_is_enough_firing_is_true_for_ongoing_incident(self):
+		# One alert for all examples: only the patched instance counts vary
 		alert = create_test_alertmanager_webhook_log()
-		total, firing = total_firing
-		firing_instances = [0] * firing
-		with (
-			patch.object(AlertmanagerWebhookLog, "total_instances", new=total),
-			patch.object(
-				AlertmanagerWebhookLog,
-				"past_alert_instances",
-				new=lambda x, y: firing_instances,
-			),
-		):
-			self.assertTrue(alert.is_enough_firing)
 
-	@given(get_total_firing_and_resolved_for_resolved_incident())
-	@settings(max_examples=20, deadline=timedelta(seconds=5))
-	def test_is_enough_firing_is_false_for_resolved_incident(self, total_firing_resolved):
+		@given(get_total_and_firing_for_ongoing_incident())
+		@settings(max_examples=20, deadline=timedelta(seconds=5))
+		def check(total_firing):
+			total, firing = total_firing
+			firing_instances = [0] * firing
+			with (
+				patch.object(AlertmanagerWebhookLog, "total_instances", new=total),
+				patch.object(
+					AlertmanagerWebhookLog,
+					"past_alert_instances",
+					new=lambda x, y: firing_instances,
+				),
+			):
+				self.assertTrue(alert.is_enough_firing)
+
+		check()
+
+	def test_is_enough_firing_is_false_for_resolved_incident(self):
+		# One alert for all examples: only the patched instance counts vary
 		alert = create_test_alertmanager_webhook_log(status="resolved")
-		total, firing, resolved = total_firing_resolved
-		firing_instances = set(range(firing))
-		resolved_instances = set(range(resolved))
 
-		with (
-			patch.object(AlertmanagerWebhookLog, "total_instances", new=total),
-			patch.object(
-				AlertmanagerWebhookLog,
-				"past_alert_instances",
-				side_effect=[firing_instances, resolved_instances],
-			),
-		):
-			self.assertFalse(alert.is_enough_firing)
+		@given(get_total_firing_and_resolved_for_resolved_incident())
+		@settings(max_examples=20, deadline=timedelta(seconds=5))
+		def check(total_firing_resolved):
+			total, firing, resolved = total_firing_resolved
+			firing_instances = set(range(firing))
+			resolved_instances = set(range(resolved))
+
+			with (
+				patch.object(AlertmanagerWebhookLog, "total_instances", new=total),
+				patch.object(
+					AlertmanagerWebhookLog,
+					"past_alert_instances",
+					side_effect=[firing_instances, resolved_instances],
+				),
+			):
+				self.assertFalse(alert.is_enough_firing)
+
+		check()
 
 	def test_incident_does_not_resolve_when_other_alerts_are_still_firing_but_does_when_less_than_required_sites_are_down(
 		self,
@@ -483,7 +496,7 @@ class TestIncident(FrappeTestCase):
 	)
 	@patch(
 		"press.incident_management.doctype.incident_investigator.incident_investigator.frappe.enqueue_doc",
-		foreground_enqueue_doc,
+		new=Mock(),
 	)
 	def test_no_calls_before_investigator_actions(self, mock_calls_create):
 		create_test_alertmanager_webhook_log()
@@ -597,9 +610,133 @@ class TestIncident(FrappeTestCase):
 				to=self.test_phno_2, from_=self.from_, url="http://demo.twilio.com/docs/voice.xml"
 			)
 
-	@patch.object(TelegramMessage, "enqueue")
-	def test_telegram_message_is_sent_when_unable_to_reach_twilio(self, mock_telegram_send):
-		print(mock_telegram_send)
+	# --- Night shift ordering tests ---
+
+	def _add_night_shifts(self, entries: list[tuple[str, str]]):
+		"""Add night shift rows to Incident Settings and clear doc cache."""
+		settings = frappe.get_doc("Incident Settings", "Incident Settings")
+		for user, day in entries:
+			settings.append("night_shifts", {"user": user, "day": day})
+		settings.save()
+
+	def _get_humans_at(self, incident: "Incident", mock_dt):
+		with (
+			patch("frappe.utils.now_datetime", return_value=mock_dt),
+			patch(
+				"press.press.doctype.incident.incident.frappe.get_cached_doc",
+				side_effect=frappe.get_doc,
+			),
+		):
+			return incident.get_humans()
+
+	def test_night_shift_users_used_during_night_hours(self):
+		"""Night shift users replace default users when a shift is defined for today."""
+		settings = frappe.get_doc("Incident Settings", "Incident Settings")
+		night_user = settings.users[0].user
+		self._add_night_shifts([(night_user, "Friday")])
+
+		incident = frappe.get_doc({"doctype": "Incident", "alertname": "Test"}).insert()
+
+		friday_2am = datetime(2024, 1, 5, 2, 0)  # Friday, outside DAY_HOURS
+		humans = self._get_humans_at(incident, friday_2am)
+
+		self.assertEqual(len(humans), 1)
+		self.assertEqual(humans[0].user, night_user)
+
+	def test_night_shift_round_robin_puts_next_user_first_on_repeat_call(self):
+		"""On repeat night call, user after acknowledged_by is first (round-robin)."""
+		settings = frappe.get_doc("Incident Settings", "Incident Settings")
+		user1 = settings.users[0].user
+		user2 = settings.users[1].user
+		self._add_night_shifts([(user1, "Friday"), (user2, "Friday")])
+
+		incident = frappe.get_doc({"doctype": "Incident", "alertname": "Test"}).insert()
+		incident.db_set("status", "Acknowledged")
+		incident.db_set("acknowledged_by", user1)
+		incident.reload()
+
+		friday_2am = datetime(2024, 1, 5, 2, 0)
+		humans = self._get_humans_at(incident, friday_2am)
+
+		self.assertEqual(humans[0].user, user2)
+
+	def test_night_shift_round_robin_wraps_around(self):
+		"""Round-robin wraps: last user acknowledged → first user goes to end, second is first."""
+		settings = frappe.get_doc("Incident Settings", "Incident Settings")
+		user1 = settings.users[0].user
+		user2 = settings.users[1].user
+		self._add_night_shifts([(user1, "Friday"), (user2, "Friday")])
+
+		incident = frappe.get_doc({"doctype": "Incident", "alertname": "Test"}).insert()
+		incident.db_set("status", "Acknowledged")
+		incident.db_set("acknowledged_by", user2)
+		incident.reload()
+
+		friday_2am = datetime(2024, 1, 5, 2, 0)
+		humans = self._get_humans_at(incident, friday_2am)
+
+		self.assertEqual(humans[0].user, user1)
+
+	def test_night_shift_falls_back_to_default_when_no_shift_for_today(self):
+		"""Falls back to all default users when no shift defined for current day."""
+		settings = frappe.get_doc("Incident Settings", "Incident Settings")
+		self._add_night_shifts([(settings.users[0].user, "Saturday")])  # Saturday only
+
+		incident = frappe.get_doc({"doctype": "Incident", "alertname": "Test"}).insert()
+
+		friday_2am = datetime(2024, 1, 5, 2, 0)  # Friday — no shift defined
+		humans = self._get_humans_at(incident, friday_2am)
+
+		self.assertEqual(len(humans), 2)
+
+	def test_night_shift_ignored_during_day_hours(self):
+		"""Night shift is not applied during DAY_HOURS even if shift exists for today."""
+		settings = frappe.get_doc("Incident Settings", "Incident Settings")
+		self._add_night_shifts([(settings.users[0].user, "Friday")])
+
+		incident = frappe.get_doc({"doctype": "Incident", "alertname": "Test"}).insert()
+
+		friday_10am = datetime(2024, 1, 5, 10, 0)  # Friday, inside DAY_HOURS
+		humans = self._get_humans_at(incident, friday_10am)
+
+		self.assertEqual(len(humans), 2)
+
+	def test_night_shift_falls_back_when_shift_user_not_in_main_users_list(self):
+		"""Falls back to default users when night shift user has no phone (not in users table)."""
+		orphan_user = create_test_press_admin_team().user
+		self._add_night_shifts([(orphan_user, "Friday")])
+
+		incident = frappe.get_doc({"doctype": "Incident", "alertname": "Test"}).insert()
+
+		friday_2am = datetime(2024, 1, 5, 2, 0)
+		humans = self._get_humans_at(incident, friday_2am)
+
+		self.assertEqual(len(humans), 2)  # both default users
+
+	def test_night_shift_falls_back_to_default_after_call_limit_exceeded(self):
+		"""Falls back to default users once MAX_ASSIGNED_CALLS_BEFORE_DEFAULT_AT_NIGHT attempts are exhausted."""
+		settings = frappe.get_doc("Incident Settings", "Incident Settings")
+		night_user = settings.users[0].user
+		self._add_night_shifts([(night_user, "Friday")])
+
+		incident = frappe.get_doc({"doctype": "Incident", "alertname": "Test"}).insert()
+
+		friday_2am = datetime(2024, 1, 5, 2, 0)
+		fake_updates = [Mock()] * MAX_ASSIGNED_CALLS_BEFORE_DEFAULT_AT_NIGHT
+		with (
+			patch("frappe.utils.now_datetime", return_value=friday_2am),
+			patch(
+				"press.press.doctype.incident.incident.frappe.get_cached_doc",
+				side_effect=frappe.get_doc,
+			),
+			patch.object(incident, "updates", fake_updates),
+		):
+			humans = incident.get_humans()
+
+		self.assertEqual(len(humans), 2)  # fallback to all default users
+
+	@patch("press.press.doctype.incident.incident.send_raven_message")
+	def test_raven_message_is_sent_when_unable_to_reach_twilio(self, mock_send_raven_message):
 		create_test_alertmanager_webhook_log()
 		incident = frappe.get_last_doc("Incident")
 		with (
@@ -607,7 +744,25 @@ class TestIncident(FrappeTestCase):
 			suppress(TwilioRestException),
 		):
 			incident.call_humans()
-		mock_telegram_send.assert_called_once()
+		mock_send_raven_message.assert_called_once()
+
+	@patch(
+		"press.press.doctype.incident.test_incident.MockTwilioCallList.create",
+		wraps=MockTwilioCallList("completed").create,
+	)
+	def test_no_calls_when_sites_recover_before_call(self, mock_calls_create):
+		incident = frappe.get_doc({"doctype": "Incident", "alertname": "Test Alert"}).insert()
+		incident.db_set("status", "Confirmed")
+
+		mock_monitor = Mock()
+		mock_monitor.get_sites_down_for_server.return_value = []
+
+		with patch.object(Incident, "monitor_server", mock_monitor):
+			incident.call_humans()
+
+		mock_calls_create.assert_not_called()
+		incident.reload()
+		self.assertEqual(incident.status, "Resolved")
 
 	def get_5_min_load_avg_prometheus_response(self, load_avg: float):
 		return {
@@ -650,3 +805,274 @@ class TestIncident(FrappeTestCase):
 			incident.resource, frappe.get_value("Server", incident.server, "database_server")
 		)  # database is checked first because history
 		self.assertEqual(incident.resource_type, "Database Server")
+
+	def get_incident_logs(self, incident: Incident, reason: str) -> list[str]:
+		return frappe.get_all(
+			"Server Activity",
+			{
+				"action": "Incident",
+				"reason": reason,
+				"document_name": ("in", [incident.server, incident.database_server]),
+			},
+			pluck="name",
+		)
+
+	def test_confirmation_of_incident_is_logged_on_server(self):
+		create_test_alertmanager_webhook_log()
+		incident: Incident = frappe.get_last_doc("Incident")
+
+		incident.status = "Confirmed"
+		incident.save()
+
+		self.assertEqual(len(self.get_incident_logs(incident, "Sites Down reported")), 1)
+
+	@patch(
+		"press.press.doctype.incident.test_incident.MockTwilioCallList.create",
+		wraps=MockTwilioCallList("busy").create,
+	)  # nobody picks up, so the incident stays Confirmed and humans are called on every run
+	def test_repeated_scheduler_runs_do_not_log_the_same_incident_again(self, mock_calls_create):
+		create_test_alertmanager_webhook_log()
+		incident: Incident = frappe.get_last_doc("Incident")
+		investigator = frappe.get_last_doc("Incident Investigator")
+		investigator.db_set("status", "Completed")
+
+		incident.status = "Confirmed"
+		incident.save()
+		incident.db_set(
+			"creation",
+			incident.creation
+			- timedelta(seconds=CONFIRMATION_THRESHOLD_SECONDS_NIGHT + CALL_THRESHOLD_SECONDS_NIGHT + 10),
+		)  # time to call for help; humans get called on every run from now on
+
+		resolve_incidents()
+		resolve_incidents()
+
+		incident.reload()
+		self.assertEqual(incident.status, "Confirmed")
+		self.assertEqual(len(self.get_incident_logs(incident, "Sites Down reported")), 1)
+
+	def test_resolution_of_confirmed_incident_is_logged_on_server_once(self):
+		create_test_alertmanager_webhook_log()
+		incident: Incident = frappe.get_last_doc("Incident")
+
+		incident.status = "Confirmed"
+		incident.save()
+		incident.resolve()
+
+		self.assertEqual(incident.status, "Resolved")
+		self.assertEqual(len(self.get_incident_logs(incident, "Sites Down resolved")), 1)
+
+	def test_reopened_incident_is_not_logged_on_server_again(self):
+		create_test_alertmanager_webhook_log()
+		incident: Incident = frappe.get_last_doc("Incident")
+
+		incident.status = "Confirmed"
+		incident.save()
+		incident.resolve()
+
+		incident.status = "Confirmed"  # reopened by hand because the sites went down again
+		incident.save()
+		incident.resolve()
+
+		self.assertEqual(len(self.get_incident_logs(incident, "Sites Down reported")), 1)
+		self.assertEqual(len(self.get_incident_logs(incident, "Sites Down resolved")), 1)
+
+	def test_incident_that_was_never_confirmed_is_not_logged_on_server(self):
+		site = create_test_site()
+		alert = create_test_prometheus_alert_rule()
+		create_test_alertmanager_webhook_log(site=site, alert=alert, status="firing")
+		incident: Incident = frappe.get_last_doc("Incident")
+
+		create_test_alertmanager_webhook_log(site=site, alert=alert, status="resolved")
+		resolve_incidents()
+
+		incident.reload()
+		self.assertEqual(incident.status, "Auto-Resolved")
+		self.assertEqual(self.get_incident_logs(incident, "Sites Down resolved"), [])
+		self.assertEqual(self.get_incident_logs(incident, "Sites Down reported"), [])
+
+	def test_ignoring_incident_without_a_reason_is_rejected(self):
+		create_test_alertmanager_webhook_log()
+		incident: Incident = frappe.get_last_doc("Incident")
+
+		with self.assertRaisesRegex(
+			frappe.ValidationError, "Please give a reason for ignoring this incident."
+		):
+			incident.ignore("   ")
+		self.assertFalse(frappe.db.get_value("Incident", incident.name, "ignored"))
+
+	def test_stop_ignoring_clears_ignore_and_comments_the_reason(self):
+		create_test_alertmanager_webhook_log()
+		incident: Incident = frappe.get_last_doc("Incident")
+		incident.ignore("Customer stopped their own benches")
+
+		incident.stop_ignoring("Benches are running again but sites are still down")
+
+		ignored, ignore_reason = frappe.db.get_value("Incident", incident.name, ["ignored", "ignore_reason"])
+		self.assertFalse(ignored)
+		self.assertIsNone(ignore_reason)
+		self.assertTrue(
+			frappe.db.exists(
+				"Comment",
+				{
+					"reference_name": incident.name,
+					"content": "Stopped ignoring incident: Benches are running again but sites are still down",
+				},
+			)
+		)
+
+	def test_stop_ignoring_without_a_reason_is_rejected(self):
+		create_test_alertmanager_webhook_log()
+		incident: Incident = frappe.get_last_doc("Incident")
+		incident.ignore("Customer stopped their own benches")
+
+		with self.assertRaisesRegex(
+			frappe.ValidationError, "Please give a reason for no longer ignoring this incident."
+		):
+			incident.stop_ignoring("  ")
+		self.assertTrue(frappe.db.get_value("Incident", incident.name, "ignored"))
+
+	def test_stop_ignoring_an_incident_that_is_not_ignored_is_rejected(self):
+		create_test_alertmanager_webhook_log()
+		incident: Incident = frappe.get_last_doc("Incident")
+
+		with self.assertRaisesRegex(frappe.ValidationError, "This incident is not being ignored."):
+			incident.stop_ignoring("Calls should resume")
+
+	def test_ignored_incident_keeps_new_incidents_from_opening_while_alert_fires(self):
+		site = create_test_site()
+		create_test_alertmanager_webhook_log(site=site)
+		incident: Incident = frappe.get_last_doc("Incident")
+		incident.ignore("Customer stopped their own benches")
+		incident_count = frappe.db.count("Incident")
+
+		create_test_alertmanager_webhook_log(site=site)
+		self.assertEqual(frappe.db.count("Incident"), incident_count)
+
+	@patch(
+		"press.press.doctype.incident.test_incident.MockTwilioCallList.create",
+		wraps=MockTwilioCallList("completed").create,
+	)
+	def test_ignored_incident_does_not_call_humans_even_when_calls_are_due(self, mock_calls_create):
+		create_test_alertmanager_webhook_log()
+		incident: Incident = frappe.get_last_doc("Incident")
+		frappe.get_last_doc("Incident Investigator").db_set("status", "Completed")
+		incident.db_set("status", "Acknowledged")
+		incident.ignore("Customer stopped their own benches")
+		incident.reload()
+		incident.db_set(
+			"modified",
+			incident.modified - timedelta(seconds=CALL_REPEAT_INTERVAL_NIGHT + 10),
+			update_modified=False,
+		)
+
+		resolve_incidents()
+		incident.call_humans()  # a call that was queued before the incident was ignored
+		mock_calls_create.assert_not_called()
+
+	@patch(
+		"press.press.doctype.incident.test_incident.MockTwilioCallList.create",
+		wraps=MockTwilioCallList("completed").create,
+	)
+	def test_stop_ignoring_resumes_overdue_calls_without_waiting_again(self, mock_calls_create):
+		create_test_alertmanager_webhook_log()
+		incident: Incident = frappe.get_last_doc("Incident")
+		frappe.get_last_doc("Incident Investigator").db_set("status", "Completed")
+		incident.db_set("status", "Acknowledged")
+		incident.ignore("Customer stopped their own benches")
+		incident.reload()
+		incident.db_set(
+			"modified",
+			incident.modified - timedelta(seconds=CALL_REPEAT_INTERVAL_NIGHT + 10),
+			update_modified=False,
+		)
+		resolve_incidents()
+		mock_calls_create.assert_not_called()
+
+		incident.creation = str(incident.creation)  # the Desk form sends dates as strings
+		incident.modified = str(incident.modified)
+		incident.stop_ignoring("Benches are running again but sites are still down")
+		mock_calls_create.assert_called_once()
+
+	@patch.object(Incident, "send_mail")
+	def test_ignored_incident_still_emails_customers_and_stays_on_website(self, mock_send_mail: Mock):
+		frappe.db.set_single_value("Incident Settings", "email_alerts", 1)
+		create_test_alertmanager_webhook_log()
+		incident: Incident = frappe.get_last_doc("Incident")
+		shown_in_website = incident.show_in_website
+		incident.ignore("Customer stopped their own benches")
+		mock_send_mail.reset_mock()  # the incident was announced when it opened
+
+		incident.resolve()
+		mock_send_mail.assert_called_once()
+		self.assertEqual(frappe.db.get_value("Incident", incident.name, "show_in_website"), shown_in_website)
+
+	@patch(
+		"press.press.doctype.incident.test_incident.MockTwilioCallList.create",
+		wraps=MockTwilioCallList("completed").create,
+	)
+	def test_ignored_incident_still_calls_customers(self, mock_calls_create):
+		create_test_alertmanager_webhook_log()
+		incident: Incident = frappe.get_last_doc("Incident")
+		incident.ignore("Customer stopped their own benches")
+
+		incident._call_customer("+911234567893")
+		mock_calls_create.assert_called_once()
+
+	@patch("press.press.doctype.incident.incident.frappe.sendmail")
+	@patch("press.press.doctype.incident.incident.get_communication_info", return_value=["ops@example.com"])
+	def test_send_custom_email_mails_server_contacts_and_comments(self, _, mock_sendmail: Mock):
+		create_test_alertmanager_webhook_log()
+		incident: Incident = frappe.get_last_doc("Incident")
+
+		incident.send_custom_email("Update on your incident", "<p>Your benches were stopped.</p>")
+
+		mock_sendmail.assert_called_once()
+		self.assertEqual(mock_sendmail.call_args.kwargs["recipients"], ["ops@example.com"])
+		self.assertEqual(mock_sendmail.call_args.kwargs["subject"], "Update on your incident")
+		self.assertTrue(
+			frappe.db.exists(
+				"Comment",
+				{
+					"reference_name": incident.name,
+					"content": ("like", "%Update on your incident%"),
+				},
+			)
+		)
+
+	@patch("press.press.doctype.incident.incident.frappe.sendmail")
+	def test_press_user_cannot_ignore_incident_or_send_email(self, mock_sendmail: Mock):
+		create_test_alertmanager_webhook_log()
+		incident: Incident = frappe.get_last_doc("Incident")
+		user = frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": frappe.mock("email"),
+				"first_name": "Customer",
+				"send_welcome_email": 0,
+				"roles": [{"role": "Press User"}],
+			}
+		).insert()
+
+		frappe.set_user(user.name)
+		try:
+			for action in (
+				lambda: incident.ignore("Customer stopped their own benches"),
+				lambda: incident.send_custom_email("Update on your incident", "<p>Hello</p>"),
+			):
+				with self.assertRaises(frappe.PermissionError):
+					action()
+		finally:
+			frappe.set_user("Administrator")
+		self.assertFalse(frappe.db.get_value("Incident", incident.name, "ignored"))
+		mock_sendmail.assert_not_called()
+
+	@patch("press.press.doctype.incident.incident.frappe.sendmail")
+	@patch("press.press.doctype.incident.incident.get_communication_info", return_value=[])
+	def test_send_custom_email_without_recipients_is_rejected(self, _, mock_sendmail: Mock):
+		create_test_alertmanager_webhook_log()
+		incident: Incident = frappe.get_last_doc("Incident")
+
+		with self.assertRaisesRegex(frappe.ValidationError, "No one is set up to receive emails"):
+			incident.send_custom_email("Update on your incident", "<p>Hello</p>")
+		mock_sendmail.assert_not_called()

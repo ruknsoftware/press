@@ -14,6 +14,23 @@ users:
   - {{ ssh_key }}
 
 runcmd:
+
+{% if nat_gateway_ip %}
+- |
+    IFACE=$(ip route show default | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n 1)
+
+    cat <<EOF > /etc/netplan/99-custom-gateway.yaml
+    network:
+      ethernets:
+        $IFACE:
+          routes:
+            - to: default
+              via: {{ nat_gateway_ip }}
+    EOF
+
+    netplan apply
+{% endif %}
+
 - mkdir /etc/ssh/auth_principals
 - curl https://cloud.frappe.io/files/ca.pub > /etc/ssh/ca.pub && chmod 644 /etc/ssh/ca.pub
 - su - frappe -c "cd /home/frappe/agent && env/bin/agent setup config --name {{ server.name }} --workers 2"
@@ -33,6 +50,12 @@ runcmd:
 - iptables -D INPUT -j REJECT --reject-with icmp-host-prohibited
 - sed -i 's/^-A INPUT -j REJECT --reject-with icmp-host-prohibited$/#-A INPUT -j REJECT --reject-with icmp-host-prohibited/g' /etc/iptables/rules.v4
 {% endif %}
+
+# CVE-2026-31431: https://copy.fail/
+- |
+    echo "install algif_aead /bin/false" >> /etc/modprobe.d/disable-algif_aead.conf
+    rmmod algif_aead 2>/dev/null || true
+    rmmod algif_aead 2>/dev/null || true
 
 {% if server.provider == 'DigitalOcean' %}
 - |
@@ -65,6 +88,11 @@ runcmd:
     systemctl restart mysqld_exporter || true
     systemctl restart deadlock_logger || true
     systemctl restart statsd_exporter || true
+{% endif %}
+
+{% if server.doctype == 'Database Server' or is_unified_server %}
+# The image has the default monitor password; replace it with the cluster's
+- mariadb --host=localhost -e "ALTER USER IF EXISTS 'monitor'@'%' IDENTIFIED BY '{{ mariadb_monitor_password }}'"
 {% endif %}
 
 write_files:

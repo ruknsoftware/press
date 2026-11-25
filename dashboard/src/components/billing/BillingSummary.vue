@@ -1,17 +1,19 @@
 <template>
 	<div class="flex flex-col gap-4">
-		<div class="flex flex-col rounded-lg text-base text-gray-900 shadow">
+		<div
+			class="flex flex-col rounded-lg text-base text-ink-gray-9 shadow dark:border"
+		>
 			<div class="flex flex-col gap-2.5 px-4 py-3">
 				<div class="flex items-center justify-between">
 					<div class="flex flex-col gap-1.5">
 						<div class="text-lg font-semibold">Recurring Charges</div>
-						<div class="text-gray-700">
+						<div class="text-ink-gray-7">
 							<span>Next charge date — </span>
 							<span>{{ currentMonthEnd() }}</span>
 						</div>
 						<div
 							v-if="team.doc.payment_mode === 'UPI Autopay'"
-							class="mt-2 rounded-md bg-gray-50 p-3 text-sm leading-5 text-gray-600"
+							class="mt-2 rounded-md bg-surface-gray-1 p-3 text-sm leading-5 text-ink-gray-6"
 						>
 							Your UPI will be auto-debited at the end of the billing cycle.
 							Payment may take up to 24 hours to reflect after debit is
@@ -20,11 +22,11 @@
 					</div>
 				</div>
 				<div class="flex items-center justify-between">
-					<div class="flex gap-2 text-gray-700">
+					<div class="flex gap-2 text-ink-gray-7">
 						<lucide-credit-card class="h-4 w-4" />
 						<div>
 							<span>Current billing amount so far is </span>
-							<span class="font-medium text-gray-900">
+							<span class="font-medium text-ink-gray-9">
 								{{ currency }} {{ currentBillingAmount?.toFixed(2) || '0.00' }}
 							</span>
 						</div>
@@ -36,9 +38,9 @@
 			</div>
 			<div
 				v-if="unpaidAmount.data"
-				class="m-1.5 flex items-center justify-between rounded-lg bg-gray-50 px-2.5 py-2"
+				class="m-1.5 flex items-center justify-between rounded-lg bg-surface-gray-1 px-2.5 py-2"
 			>
-				<div class="flex h-7 items-center gap-2 text-gray-800">
+				<div class="flex h-7 items-center gap-2 text-ink-gray-8">
 					<lucide-receipt class="h-4 w-4" />
 					<div>
 						<span>Unpaid amount is </span>
@@ -64,49 +66,50 @@
 	</div>
 </template>
 <script setup>
-import AddPrepaidCreditsDialog from './AddPrepaidCreditsDialog.vue';
-import UpcomingInvoiceDialog from './UpcomingInvoiceDialog.vue';
-import { Button, createResource } from 'frappe-ui';
-import { ref, computed, inject } from 'vue';
-import { confirmDialog } from '../../utils/components';
-import router from '../../router';
+import { Button, createResource } from 'frappe-ui'
+import { computed, inject, ref } from 'vue'
+import router from '../../router'
+import { confirmDialog } from '../../utils/components'
+import { openInvoicePaymentPage } from '../../utils/invoice'
+import AddPrepaidCreditsDialog from './AddPrepaidCreditsDialog.vue'
+import UpcomingInvoiceDialog from './UpcomingInvoiceDialog.vue'
 
-const team = inject('team');
+const team = inject('team')
 const { currentBillingAmount, upcomingInvoice, unpaidInvoices } =
-	inject('billing');
+	inject('billing')
 
-const showAddPrepaidCreditsDialog = ref(false);
-const showInvoiceDialog = ref(false);
+const showAddPrepaidCreditsDialog = ref(false)
+const showInvoiceDialog = ref(false)
 
-const currency = computed(() => (team.doc.currency == 'INR' ? '₹' : '$'));
+const currency = computed(() => (team.doc.currency == 'INR' ? '₹' : '$'))
 
 const unpaidAmount = createResource({
 	url: 'press.api.billing.total_unpaid_amount',
 	cache: 'unpaidAmount',
 	auto: true,
-});
+})
 
 const currentMonthEnd = () => {
-	const date = new Date();
-	const lastDay = new Date(date.getFullYear(), date.getMonth() + 1, 0);
+	const date = new Date()
+	const lastDay = new Date(date.getFullYear(), date.getMonth() + 1, 0)
 	return lastDay.toLocaleDateString('en-US', {
 		day: 'numeric',
 		month: 'short',
 		year: 'numeric',
-	});
-};
+	})
+}
 
 function payNow() {
 	team.doc.payment_mode == 'Prepaid Credits'
 		? (showAddPrepaidCreditsDialog.value = true)
-		: payUnpaidInvoices();
+		: payUnpaidInvoices()
 }
 
 function payUnpaidInvoices() {
-	let _unpaidInvoices = unpaidInvoices.data;
+	let _unpaidInvoices = unpaidInvoices.data
 	if (_unpaidInvoices.length > 1) {
 		if (team.doc.payment_mode === 'Prepaid Credits') {
-			showAddPrepaidCreditsDialog.value = true;
+			showAddPrepaidCreditsDialog.value = true
 		} else {
 			confirmDialog({
 				title: 'Multiple unpaid invoices',
@@ -116,20 +119,22 @@ function payUnpaidInvoices() {
 					label: 'Go to invoices',
 					variant: 'solid',
 					onClick: ({ hide }) => {
-						router.push({ name: 'BillingInvoices' });
-						hide();
+						router.push({ name: 'BillingInvoices' })
+						hide()
 					},
 				},
-			});
+			})
 		}
 	} else {
-		let invoice = _unpaidInvoices;
-		if (invoice.stripe_invoice_url && team.doc.payment_mode === 'Card') {
-			window.open(
-				`/api/method/press.api.client.run_doc_method?dt=Invoice&dn=${invoice.name}&method=stripe_payment_url`,
-			);
+		let invoice = _unpaidInvoices[0]
+		if (
+			invoice &&
+			invoice.stripe_invoice_url &&
+			team.doc.payment_mode === 'Card'
+		) {
+			openInvoicePaymentPage(invoice.name)
 		} else {
-			showAddPrepaidCreditsDialog.value = true;
+			showAddPrepaidCreditsDialog.value = true
 		}
 	}
 }

@@ -1,5 +1,5 @@
 <template>
-	<Header class="sticky top-0 z-10 bg-white">
+	<Header class="sticky top-0 z-10 bg-surface-white">
 		<div class="flex items-center space-x-2">
 			<Breadcrumbs :items="[{ label: 'Status', route: '/status' }]" />
 		</div>
@@ -26,18 +26,17 @@
 <script setup>
 import Header from '../components/Header.vue';
 import { Breadcrumbs } from 'frappe-ui';
-import { icon } from '../utils/components';
 import TabsWithRouter from '../components/TabsWithRouter.vue';
 
 const tabs = [
 	{
 		label: 'Ongoing Incidents',
-		icon: icon('activity'),
+		icon: LucideTriangleAlert,
 		routeName: 'OngoingIncidents',
 	},
 	{
 		label: 'Incident History',
-		icon: icon('archive'),
+		icon: LucideArchive,
 		routeName: 'IncidentHistory',
 	},
 ];

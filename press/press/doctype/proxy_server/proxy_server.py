@@ -7,10 +7,15 @@ import json
 import frappe
 from frappe.utils import unique
 
+from press.access.staff_roles import safe_for_readers
 from press.press.doctype.server.server import BaseServer
 from press.runner import Ansible
 from press.security import fail2ban
 from press.utils import log_error
+
+# ProxySQL image version rolled out to all proxies. Bumped from 2.3.2 to fix
+# ProxySQL failing to serve newly issued Let's Encrypt certificates.
+PROXYSQL_VERSION = "3.0.9"
 
 
 class ProxyServer(BaseServer):
@@ -31,6 +36,7 @@ class ProxyServer(BaseServer):
 		bastion_server: DF.Link | None
 		cluster: DF.Link | None
 		disable_agent_job_auto_retry: DF.Check
+		disable_agent_update: DF.Check
 		domain: DF.Link | None
 		domains: DF.Table[ProxyServerDomain]
 		enabled_default_routing: DF.Check
@@ -41,6 +47,7 @@ class ProxyServer(BaseServer):
 		hostname: DF.Data
 		hostname_abbreviation: DF.Data | None
 		ip: DF.Data | None
+		is_auditd_setup: DF.Check
 		is_primary: DF.Check
 		is_proxysql_setup: DF.Check
 		is_replication_setup: DF.Check
@@ -48,6 +55,9 @@ class ProxyServer(BaseServer):
 		is_server_setup: DF.Check
 		is_ssh_proxy_setup: DF.Check
 		is_static_ip: DF.Check
+		is_wazuh_agent_installed: DF.Check
+		wazuh_agent_status: DF.Data | None
+		wazuh_install_last_attempt: DF.Datetime | None
 		is_wireguard_setup: DF.Check
 		mem_limits: DF.Code | None
 		plan: DF.Link | None
@@ -60,7 +70,6 @@ class ProxyServer(BaseServer):
 			"Generic", "Scaleway", "AWS EC2", "OCI", "Hetzner", "Vodacom", "DigitalOcean", "Frappe Compute"
 		]
 		proxysql_admin_password: DF.Password | None
-		proxysql_monitor_password: DF.Password | None
 		public: DF.Check
 		root_public_key: DF.Code | None
 		self_hosted_server_domain: DF.Data | None
@@ -133,6 +142,7 @@ class ProxyServer(BaseServer):
 				user=self.ssh_user or "root",
 				port=self.ssh_port or 22,
 				variables={
+					"fail2ban_ignore_ips": fail2ban.ignore_ips(),
 					"server": self.name,
 					"workers": 1,
 					"domain": self.domain,
@@ -141,7 +151,7 @@ class ProxyServer(BaseServer):
 					"monitoring_password": monitoring_password,
 					"log_server": log_server,
 					"kibana_password": kibana_password,
-					"certificate_private_key": certificate.private_key,
+					"certificate_private_key": certificate.get_private_key(),
 					"certificate_full_chain": certificate.full_chain,
 					"certificate_intermediate_chain": certificate.intermediate_chain,
 					"press_url": frappe.utils.get_url(),
@@ -152,6 +162,8 @@ class ProxyServer(BaseServer):
 			if play.status == "Success":
 				self.status = "Active"
 				self.is_server_setup = True
+				self.set_auditd_setup_from_base_playbook()
+				self.install_wazuh_agent_if_configured()
 			else:
 				self.status = "Broken"
 		except Exception:
@@ -179,7 +191,7 @@ class ProxyServer(BaseServer):
 	@frappe.whitelist()
 	def setup_ssh_proxy(self):
 		if not self.ssh_certificate_authority:
-			frappe.throw("SSH Certificate Authority is required to setup SSH Proxy")
+			frappe.throw("Please configure an SSH Certificate Authority before setting up the SSH Proxy.")
 
 		frappe.enqueue_doc(self.doctype, self.name, "_setup_ssh_proxy", queue="long", timeout=1200)
 
@@ -213,95 +225,17 @@ class ProxyServer(BaseServer):
 			log_error("SSH Proxy Setup Exception", server=self.as_dict())
 
 	@frappe.whitelist()
-	def setup_fail2ban(self):
-		frappe.enqueue_doc(
-			self.doctype,
-			self.name,
-			"_setup_fail2ban",
-			queue="long",
-			timeout=1200,
-		)
-		self.status = "Installing"
-		self.save()
-
-	def _setup_fail2ban(self):
-		try:
-			ansible = Ansible(
-				playbook="fail2ban.yml",
-				server=self,
-				user=self._ssh_user(),
-				port=self._ssh_port(),
-				variables={
-					"ignore_ips": fail2ban.ignore_ips(),
-				},
-			)
-			play = ansible.run()
-			self.reload()
-			if play.status == "Success":
-				self.status = "Active"
-			else:
-				self.status = "Broken"
-		except Exception:
-			self.status = "Broken"
-			log_error("Fail2ban Setup Exception", server=self.as_dict())
-		self.save()
-
-	@frappe.whitelist()
-	def remove_fail2ban(self):
-		frappe.enqueue_doc(
-			self.doctype,
-			self.name,
-			"_remove_fail2ban",
-			queue="long",
-			timeout=1200,
-		)
-		self.status = "Installing"
-		self.save()
-
-	def _remove_fail2ban(self):
-		try:
-			ansible = Ansible(
-				playbook="fail2ban_remove.yml",
-				server=self,
-				user=self._ssh_user(),
-				port=self._ssh_port(),
-			)
-			play = ansible.run()
-			self.reload()
-			if play.status == "Success":
-				self.status = "Active"
-			else:
-				self.status = "Broken"
-		except Exception:
-			self.status = "Broken"
-			log_error("Fail2ban Setup Exception", server=self.as_dict())
-		self.save()
-
-	@frappe.whitelist()
 	def setup_proxysql(self):
 		frappe.enqueue_doc(self.doctype, self.name, "_setup_proxysql", queue="long", timeout=1200)
 
 	def _setup_proxysql(self):
 		try:
-			default_hostgroup = (
-				frappe.get_all(
-					"Database Server",
-					"MIN(server_id)",
-					{"status": "Active", "cluster": self.cluster},
-					as_list=True,
-				)[0][0]
-				or 0
-			)
 			ansible = Ansible(
 				playbook="proxysql.yml",
 				server=self,
 				user=self._ssh_user(),
 				port=self._ssh_port(),
-				variables={
-					"server": self.name,
-					"proxysql_admin_password": self.get_password("proxysql_admin_password"),
-					"default_hostgroup": default_hostgroup,
-				},
+				variables=self.get_proxysql_monitor_variables(),
 			)
 			play = ansible.run()
 			if play.status == "Success":
@@ -313,6 +247,23 @@ class ProxyServer(BaseServer):
 					self.reboot()
 		except Exception:
 			log_error("ProxySQL Setup Exception", server=self.as_dict())
+
+	@frappe.whitelist()
+	def update_proxysql(self):
+		frappe.enqueue_doc(self.doctype, self.name, "_update_proxysql", queue="long", timeout=1200)
+
+	def _update_proxysql(self):
+		try:
+			ansible = Ansible(
+				playbook="update_proxysql.yml",
+				server=self,
+				user=self._ssh_user(),
+				port=self._ssh_port(),
+				variables={"proxysql_version": PROXYSQL_VERSION},
+			)
+			ansible.run()
+		except Exception:
+			log_error("ProxySQL Update Exception", server=self.as_dict())
 
 	@frappe.whitelist()
 	def setup_replication(self):
@@ -393,26 +344,41 @@ class ProxyServer(BaseServer):
 
 	def _setup_proxysql_monitor(self):
 		try:
-			default_hostgroup = frappe.get_all(
-				"Database Server",
-				"MIN(server_id)",
-				{"status": "Active", "cluster": self.cluster},
-				as_list=True,
-			)[0][0]
 			ansible = Ansible(
 				playbook="proxysql_monitor.yml",
 				server=self,
 				user=self._ssh_user(),
 				port=self._ssh_port(),
-				variables={
-					"server": self.name,
-					"proxysql_admin_password": self.get_password("proxysql_admin_password"),
-					"default_hostgroup": default_hostgroup,
-				},
+				variables=self.get_proxysql_monitor_variables(),
 			)
 			ansible.run()
 		except Exception:
 			log_error("ProxySQL Monitor Setup Exception", server=self.as_dict())
+
+	def get_proxysql_monitor_variables(self) -> dict:
+		"""ProxySQL health checks and the exporter both log in to MariaDB as the monitor user."""
+		variables = {
+			"proxysql_admin_password": self.get_password("proxysql_admin_password"),
+			"mariadb_monitor_password": frappe.get_doc("Cluster", self.cluster).get_password(
+				"mariadb_monitor_password"
+			),
+		}
+		# Without these, proxysql.yml skips the exporter and proxysql_monitor.yml fails
+		if database_server := self.get_monitored_database_server():
+			variables["database_server_private_ip"] = database_server.private_ip
+			variables["database_server_port"] = database_server.db_port or 3306
+		return variables
+
+	def get_monitored_database_server(self) -> frappe._dict | None:
+		"""The exporter connects straight to the first active database server of the cluster."""
+		database_servers = frappe.get_all(
+			"Database Server",
+			filters={"status": "Active", "cluster": self.cluster},
+			fields=["private_ip", "db_port"],
+			order_by="server_id asc",
+			limit=1,
+		)
+		return database_servers[0] if database_servers else None
 
 	@frappe.whitelist()
 	def setup_wireguard(self):
@@ -504,12 +470,16 @@ class ProxyServer(BaseServer):
 
 		primary = frappe.db.get_value("Proxy Server", self.primary, ["cluster", "is_static_ip"], as_dict=True)
 		if self.cluster != primary.cluster:
-			frappe.throw("Failover can only be initiated between Proxy Servers in the same cluster")
+			frappe.throw(
+				"Failover can only be initiated between proxy servers in the same cluster. Please choose a target proxy server in the same cluster."
+			)
 
 		if (not primary.is_static_ip and not self.is_static_ip) or (
 			primary.is_static_ip and self.is_static_ip
 		):
-			frappe.throw("Failover can only be initiated if one of the proxy server has a static ip")
+			frappe.throw(
+				"Failover needs one of the proxy servers to have a static IP. Please assign a static IP to a proxy server first."
+			)
 
 		frappe.get_doc(
 			{
@@ -537,10 +507,30 @@ class ProxyServer(BaseServer):
 		return "Added a dashboard banner and queued reduction of dns record ttl on sites"
 
 	@frappe.whitelist()
+	@safe_for_readers
 	def get_memory_limits(self):
 		if self.mem_limits:
 			return json.loads(self.mem_limits)
 		return None
+
+	@frappe.whitelist()
+	def setup_user_ssh_certificate(self):
+		frappe.enqueue_doc(self.doctype, self.name, "_setup_user_ssh_certificate", queue="long", timeout=1200)
+
+	def _setup_user_ssh_certificate(self):
+		try:
+			ansible = Ansible(
+				playbook="user_ssh_certificate.yml",
+				server=self,
+				user=self._ssh_user(),
+				port=self._ssh_port(),
+				variables={
+					"server": self.name,
+				},
+			)
+			ansible.run()
+		except Exception:
+			log_error("User SSH Certificate Setup Exception", doc=self)
 
 	@frappe.whitelist()
 	def set_memory_limits(self, limits: list):
