@@ -7,7 +7,7 @@
 				{
 					label: 'Add App',
 					variant: 'solid',
-					disabled: !appValidated && !selectedVersion,
+					disabled: !appValidated,
 					onClick: addApp,
 				},
 			],

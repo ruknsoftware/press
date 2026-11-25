@@ -220,11 +220,11 @@ class MarketplaceApp(WebsiteGenerator):
 
 		if not self.sources:
 			source = app_doc.add_source(
-				self.version,
-				self.repository_url,
-				self.branch,
-				self.team,
-				self.github_installation_id,
+				repository_url=self.repository_url,
+				branch=self.branch,
+				team=self.team,
+				github_installation_id=self.github_installation_id,
+				frappe_version=self.frappe_version,
 				public=getattr(self, "is_public", True),
 			)
 			self.app = source.app

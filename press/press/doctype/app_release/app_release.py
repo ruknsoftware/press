@@ -657,9 +657,7 @@ def check_python_syntax(dirpath: str) -> str:
 	- -q: quiet, only print errors (stdout)
 	- -o: optimize level, 0 is no optimization
 	"""
-	# Our Update read python path from bench
 	_python = get_python_path(dirpath)
-	# _python = _get_python_path()
 	command = f"{_python} -m compileall -q -o 0 {dirpath}"
 	proc = subprocess.run(
 		shlex.split(command),

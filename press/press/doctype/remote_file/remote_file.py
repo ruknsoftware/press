@@ -419,7 +419,7 @@ def delete_s3_files(buckets):
 	for bucket_name in buckets:
 		bucket_endpoint_url = frappe.db.get_value("Backup Bucket", bucket_name, "endpoint_url")
 		region = press_settings.backup_region
-		endpoint_url = f"https://s3.{region}.amazonaws.com"
+		endpoint_url = f"https://s3.{region}.amazonaws.com" if region else "https://s3.amazonaws.com"
 		if bucket_endpoint_url:
 			endpoint_url = bucket_endpoint_url
 		if "s3.me-south-1.amazonaws.com" in endpoint_url:
